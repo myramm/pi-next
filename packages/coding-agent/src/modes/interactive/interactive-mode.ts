@@ -3313,6 +3313,12 @@ export class InteractiveMode {
 				await this.handleClearCommand(true);
 				return;
 			}
+			if (text === "/skill" || text.startsWith("/skill ")) {
+				const arg = text.startsWith("/skill ") ? text.slice(7).trim() : "";
+				this.editor.setText("");
+				await this.handleSkillSlashCommand(arg);
+				return;
+			}
 			if (text === "/compact" || text.startsWith("/compact ")) {
 				const customInstructions = text.startsWith("/compact ") ? text.slice(9).trim() : undefined;
 				this.editor.setText("");
@@ -6963,6 +6969,59 @@ export class InteractiveMode {
 		} catch (error: unknown) {
 			await this.handleFatalRuntimeError("Failed to create session", error);
 		}
+	}
+
+	private async handleSkillSlashCommand(arg: string): Promise<void> {
+		if (arg.startsWith("install ") || arg.startsWith("add ")) {
+			const source = arg.replace(/^(install|add)\s+/, "").trim();
+			if (!source) {
+				this.showError("Usage: /skill install <url>");
+				return;
+			}
+			this.showStatus(`Installing skill from ${source}...`);
+			try {
+				const { installSkillFromSource } = await import("../../core/skills.ts");
+				const result = await installSkillFromSource(source, path.join(getAgentDir(), "skills"));
+				await this.handleReloadCommand();
+				this.chatContainer.addChild(new Spacer(1));
+				this.chatContainer.addChild(
+					new ThemedText(() => theme.fg("success", `✓ Installed skill "${result.name}" (${result.targetDir})`), 1, 1),
+				);
+				this.chatContainer.addChild(
+					new ThemedText(() => theme.fg("muted", `You can now invoke this skill with /skill:${result.name}`), 1, 0),
+				);
+				this.ui.requestRender();
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				this.showError(`Failed to install skill: ${msg}`);
+			}
+			return;
+		}
+
+		// List installed skills
+		const skills = this.session.resourceLoader.getSkills().skills;
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "Installed Skills:")), 1, 1));
+		if (skills.length === 0) {
+			this.chatContainer.addChild(
+				new ThemedText(
+					() => theme.fg("muted", "No skills installed. Run /skill install <url> or rts install <url> to add skills."),
+					1,
+					0,
+				),
+			);
+		} else {
+			for (const s of skills) {
+				this.chatContainer.addChild(
+					new ThemedText(
+						() => `${theme.fg("accent", `/skill:${s.name}`)} - ${theme.fg("muted", s.description || "No description")}`,
+						1,
+						0,
+					),
+				);
+			}
+		}
+		this.ui.requestRender();
 	}
 
 	private handleDebugCommand(): void {

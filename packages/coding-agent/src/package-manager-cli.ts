@@ -977,10 +977,28 @@ export async function handlePackageCommand(
 
 	try {
 		switch (options.command) {
-			case "install":
+			case "install": {
+				if (
+					source!.endsWith(".md") ||
+					source!.includes("skill") ||
+					source!.startsWith("git@") ||
+					source!.startsWith("https://github.com/") ||
+					source!.endsWith(".git")
+				) {
+					try {
+						const { installSkillFromSource } = await import("./core/skills.ts");
+						const skillDir = options.local ? join(cwd, CONFIG_DIR_NAME, "skills") : join(agentDir, "skills");
+						const installedSkill = await installSkillFromSource(source!, skillDir);
+						console.log(chalk.green(`Installed skill "${installedSkill.name}" into ${installedSkill.targetDir}`));
+						return true;
+					} catch {
+						// Fallback to standard package manager
+					}
+				}
 				await packageManager.installAndPersist(source!, { local: options.local });
 				console.log(chalk.green(`Installed ${source}`));
 				return true;
+			}
 
 			case "remove": {
 				const removed = await packageManager.removeAndPersist(source!, { local: options.local });

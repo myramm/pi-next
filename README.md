@@ -39,6 +39,10 @@ Inside the interactive chat, run `/login` to set up provider keys (OpenAI, Anthr
 ## ✨ Features & Enhancements in RTS
 
 - 🧹 **/clear**: Reset conversation history and instantly wipe the terminal screen and scrollback buffer (just like `agy /clear`).
+- ⚡ **Skill Management & Auto-Install**:
+  - In chat: run `/skill` to list installed skills, or `/skill install <url>` to fetch and install any skill repo or `SKILL.md`.
+  - In CLI: run `rts install <url>` or `pi install <url>`. It inspects frontmatter `name:`, creates `~/.pi/agent/skills/<skill-name>/`, and moves `SKILL.md` into place automatically!
+  - Invoke any installed skill in chat with `/skill:<name>`.
 - 🎨 **Expanded Built-in Themes**:
   - **`antigravity`**: Google Antigravity dark slate & electric cyan theme.
   - **`claude-code`**: Claude Code signature warm terracotta, ivory, and dark charcoal.

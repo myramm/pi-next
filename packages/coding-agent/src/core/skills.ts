@@ -1,4 +1,6 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { spawnSync } from "child_process";
+import { tmpdir } from "os";
 import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
@@ -512,3 +514,175 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 		diagnostics: [...allDiagnostics, ...collisionDiagnostics],
 	};
 }
+
+/**
+ * Install a skill from a URL (raw SKILL.md or git repository) or local path.
+ * Automatically inspects the frontmatter `name:` and installs the skill to `<targetBaseDir>/<skill-name>/SKILL.md`.
+ */
+export async function installSkillFromSource(
+	source: string,
+	targetBaseDir?: string,
+): Promise<{ name: string; targetDir: string; filesInstalled: number }> {
+	const userSkillsDir = targetBaseDir ?? join(getAgentDir(), "skills");
+	mkdirSync(userSkillsDir, { recursive: true });
+
+	const trimmedSource = source.trim();
+
+	// Case 1: Direct URL to raw markdown / SKILL.md
+	if (
+		/^https?:\/\/.*\.md(\?.*)?$/i.test(trimmedSource) ||
+		trimmedSource.includes("/raw/") ||
+		trimmedSource.includes("raw.githubusercontent.com")
+	) {
+		let rawUrl = trimmedSource;
+		if (rawUrl.includes("github.com") && rawUrl.includes("/blob/")) {
+			rawUrl = rawUrl.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/");
+		}
+		const res = await fetch(rawUrl);
+		if (!res.ok) {
+			throw new Error(`Failed to download skill from ${rawUrl}: HTTP ${res.status}`);
+		}
+		const content = await res.text();
+		let skillName = "";
+		try {
+			const { frontmatter } = parseFrontmatter<SkillFrontmatter>(content);
+			if (frontmatter.name && typeof frontmatter.name === "string") {
+				skillName = frontmatter.name.trim();
+			}
+		} catch {}
+
+		if (!skillName) {
+			const segments = rawUrl.split("/").filter(Boolean);
+			skillName = segments[segments.length - 2] || segments[segments.length - 1].replace(/\.md$/, "");
+			skillName = skillName.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-");
+		}
+
+		const skillDir = join(userSkillsDir, skillName);
+		mkdirSync(skillDir, { recursive: true });
+		writeFileSync(join(skillDir, "SKILL.md"), content, "utf-8");
+		return { name: skillName, targetDir: skillDir, filesInstalled: 1 };
+	}
+
+	// Case 2: Git repository URL
+	if (
+		trimmedSource.startsWith("git@") ||
+		trimmedSource.startsWith("https://github.com/") ||
+		trimmedSource.endsWith(".git")
+	) {
+		const tempDir = mkdtempSync(join(tmpdir(), "rts-skill-"));
+		try {
+			const cloneResult = spawnSync("git", ["clone", "--depth", "1", trimmedSource, tempDir], {
+				encoding: "utf-8",
+			});
+			if (cloneResult.status !== 0) {
+				throw new Error(`Failed to clone git repository: ${cloneResult.stderr || cloneResult.stdout}`);
+			}
+
+			let skillMdPath = join(tempDir, "SKILL.md");
+			let skillSourceDir = tempDir;
+
+			if (!existsSync(skillMdPath)) {
+				const subdirs = readdirSync(tempDir, { withFileTypes: true });
+				for (const sub of subdirs) {
+					if (sub.isDirectory() && sub.name !== ".git") {
+						const subSkill = join(tempDir, sub.name, "SKILL.md");
+						if (existsSync(subSkill)) {
+							skillMdPath = subSkill;
+							skillSourceDir = join(tempDir, sub.name);
+							break;
+						}
+						if (sub.name === "skills") {
+							const skillsSubdirs = readdirSync(join(tempDir, "skills"), { withFileTypes: true });
+							for (const ssub of skillsSubdirs) {
+								if (ssub.isDirectory()) {
+									const nSkill = join(tempDir, "skills", ssub.name, "SKILL.md");
+									if (existsSync(nSkill)) {
+										skillMdPath = nSkill;
+										skillSourceDir = join(tempDir, "skills", ssub.name);
+										break;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			if (!existsSync(skillMdPath)) {
+				throw new Error(`No SKILL.md found in repository: ${trimmedSource}`);
+			}
+
+			const content = readFileSync(skillMdPath, "utf-8");
+			let skillName = "";
+			try {
+				const { frontmatter } = parseFrontmatter<SkillFrontmatter>(content);
+				if (frontmatter.name && typeof frontmatter.name === "string") {
+					skillName = frontmatter.name.trim();
+				}
+			} catch {}
+
+			if (!skillName) {
+				skillName = basename(skillSourceDir);
+				skillName = skillName.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-");
+			}
+
+			const skillDir = join(userSkillsDir, skillName);
+			rmSync(skillDir, { recursive: true, force: true });
+			mkdirSync(skillDir, { recursive: true });
+
+			cpSync(skillSourceDir, skillDir, {
+				recursive: true,
+				filter: (src) => !src.includes(`${sep}.git`),
+			});
+
+			return { name: skillName, targetDir: skillDir, filesInstalled: readdirSync(skillDir).length };
+		} finally {
+			try {
+				rmSync(tempDir, { recursive: true, force: true });
+			} catch {}
+		}
+	}
+
+	// Case 3: Local file or directory
+	if (existsSync(trimmedSource)) {
+		const stat = statSync(trimmedSource);
+		if (stat.isFile() && trimmedSource.endsWith(".md")) {
+			const content = readFileSync(trimmedSource, "utf-8");
+			let skillName = "";
+			try {
+				const { frontmatter } = parseFrontmatter<SkillFrontmatter>(content);
+				if (frontmatter.name) skillName = String(frontmatter.name).trim();
+			} catch {}
+			if (!skillName) skillName = basename(trimmedSource, ".md");
+			skillName = skillName.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+
+			const skillDir = join(userSkillsDir, skillName);
+			mkdirSync(skillDir, { recursive: true });
+			writeFileSync(join(skillDir, "SKILL.md"), content, "utf-8");
+			return { name: skillName, targetDir: skillDir, filesInstalled: 1 };
+		}
+		if (stat.isDirectory()) {
+			const skillMd = join(trimmedSource, "SKILL.md");
+			if (!existsSync(skillMd)) {
+				throw new Error(`Directory does not contain SKILL.md: ${trimmedSource}`);
+			}
+			const content = readFileSync(skillMd, "utf-8");
+			let skillName = "";
+			try {
+				const { frontmatter } = parseFrontmatter<SkillFrontmatter>(content);
+				if (frontmatter.name) skillName = String(frontmatter.name).trim();
+			} catch {}
+			if (!skillName) skillName = basename(trimmedSource);
+			skillName = skillName.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+
+			const skillDir = join(userSkillsDir, skillName);
+			rmSync(skillDir, { recursive: true, force: true });
+			mkdirSync(skillDir, { recursive: true });
+			cpSync(trimmedSource, skillDir, { recursive: true, filter: (src) => !src.includes(`${sep}.git`) });
+			return { name: skillName, targetDir: skillDir, filesInstalled: readdirSync(skillDir).length };
+		}
+	}
+
+	throw new Error(`Unsupported skill source format: ${trimmedSource}`);
+}
+
