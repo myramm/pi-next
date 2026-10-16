@@ -3305,7 +3305,12 @@ export class InteractiveMode {
 			}
 			if (text === "/new") {
 				this.editor.setText("");
-				await this.handleClearCommand();
+				await this.handleClearCommand(false);
+				return;
+			}
+			if (text === "/clear") {
+				this.editor.setText("");
+				await this.handleClearCommand(true);
 				return;
 			}
 			if (text === "/compact" || text.startsWith("/compact ")) {
@@ -6941,12 +6946,16 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private async handleClearCommand(): Promise<void> {
+	private async handleClearCommand(clearScreen = false): Promise<void> {
 		this.clearStatusIndicator();
 		try {
 			const result = await this.runtimeHost.newSession();
 			if (result.cancelled) {
 				return;
+			}
+			if (clearScreen) {
+				this.chatContainer.clear();
+				this.ui.terminal.write("\x1b[2J\x1b[H\x1b[3J");
 			}
 			this.chatContainer.addChild(new Spacer(1));
 			this.chatContainer.addChild(new ThemedText(() => theme.fg("accent", "✓ New session started"), 1, 1));

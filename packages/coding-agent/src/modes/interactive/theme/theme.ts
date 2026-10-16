@@ -381,12 +381,37 @@ let BUILTIN_THEMES: Record<string, ThemeJson> | undefined;
 function getBuiltinThemes(): Record<string, ThemeJson> {
 	if (!BUILTIN_THEMES) {
 		const themesDir = getThemesDir();
-		const darkPath = path.join(themesDir, "dark.json");
-		const lightPath = path.join(themesDir, "light.json");
-		BUILTIN_THEMES = {
-			dark: JSON.parse(stripBom(fs.readFileSync(darkPath, "utf-8"))) as ThemeJson,
-			light: JSON.parse(stripBom(fs.readFileSync(lightPath, "utf-8"))) as ThemeJson,
-		};
+		BUILTIN_THEMES = {};
+		if (fs.existsSync(themesDir)) {
+			try {
+				const files = fs.readdirSync(themesDir);
+				for (const file of files) {
+					if (file.endsWith(".json")) {
+						const name = path.basename(file, ".json");
+						try {
+							const filePath = path.join(themesDir, file);
+							BUILTIN_THEMES[name] = JSON.parse(stripBom(fs.readFileSync(filePath, "utf-8"))) as ThemeJson;
+						} catch {
+							// Ignore unparseable theme files
+						}
+					}
+				}
+			} catch {
+				// Fallback
+			}
+		}
+		if (!BUILTIN_THEMES.dark) {
+			const darkPath = path.join(themesDir, "dark.json");
+			if (fs.existsSync(darkPath)) {
+				BUILTIN_THEMES.dark = JSON.parse(stripBom(fs.readFileSync(darkPath, "utf-8"))) as ThemeJson;
+			}
+		}
+		if (!BUILTIN_THEMES.light) {
+			const lightPath = path.join(themesDir, "light.json");
+			if (fs.existsSync(lightPath)) {
+				BUILTIN_THEMES.light = JSON.parse(stripBom(fs.readFileSync(lightPath, "utf-8"))) as ThemeJson;
+			}
+		}
 	}
 	return BUILTIN_THEMES;
 }
