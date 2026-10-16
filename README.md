@@ -1,14 +1,14 @@
-# RTS (Recoded AI Coding Agent)
+# pi-next (Recoded AI Coding Agent)
 
-⚡ Minimal, extensible autonomous coding agent harness (recoded from Pi) featuring `/clear` screen-wipe, expanded themes, and direct updates via **[myramm/rts](https://github.com/myramm/rts)**.
+⚡ Minimal, extensible autonomous coding agent harness (recoded from Pi) featuring `/clear` screen-wipe, expanded themes, and direct updates via **[myramm/pi-next](https://github.com/myramm/pi-next)**.
 
 ## Installation & Getting Started
 
 ### 1. Clone & Global Link (Recommended)
 
 ```bash
-git clone https://github.com/myramm/rts.git
-cd rts
+git clone https://github.com/myramm/pi-next.git
+cd pi-next
 
 # Install dependencies without heavy lifecycle scripts
 npm install --ignore-scripts
@@ -20,12 +20,12 @@ npm link packages/coding-agent
 ### 2. Quick Run from Source (No installation needed)
 
 ```bash
-git clone https://github.com/myramm/rts.git
-cd rts
+git clone https://github.com/myramm/pi-next.git
+cd pi-next
 ./pi-test.sh
 ```
 
-### 3. Start RTS
+### 3. Start pi
 
 ```bash
 cd /path/to/your/project
@@ -36,12 +36,12 @@ Inside the interactive chat, run `/login` to set up provider keys (OpenAI, Anthr
 
 ---
 
-## ✨ Features & Enhancements in RTS
+## ✨ Features & Enhancements in pi-next
 
 - 🧹 **/clear**: Reset conversation history and instantly wipe the terminal screen and scrollback buffer (just like `agy /clear`).
 - ⚡ **Skill Management & Auto-Install**:
   - In chat: run `/skill` to list installed skills, or `/skill install <url>` to fetch and install any skill repo or `SKILL.md`.
-  - In CLI: run `rts install <url>` or `pi install <url>`. It inspects frontmatter `name:`, creates `~/.pi/agent/skills/<skill-name>/`, and moves `SKILL.md` into place automatically!
+  - In CLI: run `pi install <url>`. It inspects frontmatter `name:`, creates `~/.pi/agent/skills/<skill-name>/`, and moves `SKILL.md` into place automatically!
   - Invoke any installed skill in chat with `/skill:<name>`.
 - 🎨 **Expanded Built-in Themes**:
   - **`antigravity`**: Google Antigravity dark slate & electric cyan theme.
@@ -53,7 +53,7 @@ Inside the interactive chat, run `/login` to set up provider keys (OpenAI, Anthr
   - **`monokai`**: Monokai classic palette.
   - **`nord`**: Nord Arctic frost theme.
   - **`dark` & `light`**: Standard high-contrast themes.
-- 🔄 **Direct Updater**: Self-update (`pi update`) checks directly against [`myramm/rts`](https://github.com/myramm/rts).
+- 🔄 **Direct Updater**: Self-update (`pi update`) checks directly against [`myramm/pi-next`](https://github.com/myramm/pi-next).
 
 ---
 

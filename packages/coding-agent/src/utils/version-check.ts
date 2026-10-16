@@ -55,7 +55,7 @@ export async function getLatestPiRelease(
 	if (process.env.PI_OFFLINE) return undefined;
 
 	try {
-		const ghResponse = await fetch("https://api.github.com/repos/myramm/rts/releases/latest", {
+		const ghResponse = await fetch("https://api.github.com/repos/myramm/pi-next/releases/latest", {
 			headers: {
 				"User-Agent": getPiUserAgent(currentVersion),
 				accept: "application/json",
@@ -73,7 +73,7 @@ export async function getLatestPiRelease(
 			}
 		}
 
-		const rawResponse = await fetch("https://raw.githubusercontent.com/myramm/rts/main/packages/coding-agent/package.json", {
+		const rawResponse = await fetch("https://raw.githubusercontent.com/myramm/pi-next/main/packages/coding-agent/package.json", {
 			headers: { "User-Agent": getPiUserAgent(currentVersion) },
 			signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_VERSION_CHECK_TIMEOUT_MS),
 		});
