@@ -1,44 +1,57 @@
-<p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
-</p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
-</p>
+# RTS (Recoded AI Coding Agent)
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+⚡ Minimal, extensible autonomous coding agent harness (recoded from Pi) featuring `/clear` screen-wipe, expanded themes, and direct updates via **[myramm/rts](https://github.com/myramm/rts)**.
 
-# Pi
+## Installation & Getting Started
 
-Pi is a minimal, extensible agent harness that you can make your own.
-
-Adapt Pi to your workflows, not the other way around. Customize Pi with [extensions](packages/coding-agent/docs/extensions.md), [skills](packages/coding-agent/docs/skills.md), [prompt templates](packages/coding-agent/docs/prompt-templates.md), and [themes](packages/coding-agent/docs/themes.md). Bundle them as [Pi packages](packages/coding-agent/docs/packages.md) and share via npm or git.
-
-Pi ships with powerful defaults but skips features like sub-agents and plan mode. Ask Pi to build what you want, or install a package that does it your way.
-
-Use Pi [interactively](packages/coding-agent/docs/usage.md), automate it in [print or JSON mode](packages/coding-agent/docs/cli.md), control it over [RPC](packages/coding-agent/docs/rpc.md), or build apps with the [Pi TypeScript SDK](packages/coding-agent/docs/sdk.md). See [OpenClaw](https://github.com/OpenClaw/OpenClaw) for a real-world integration.
-
-## Getting started
-
-Install the command-line interface:
+### 1. Clone & Global Link (Recommended)
 
 ```bash
-curl -fsSL https://pi.dev/install.sh | sh
+git clone https://github.com/myramm/rts.git
+cd rts
+
+# Install dependencies without heavy lifecycle scripts
+npm install --ignore-scripts
+
+# Link globally to use `pi` anywhere
+npm link packages/coding-agent
 ```
 
-On Windows:
-
-```shell
-powershell -c "irm https://pi.dev/install.ps1 | iex"
-```
-
-The installer pins all dependencies and updates Pi with `pi update`. Alternatively, install directly with npm, which does not pin transitive dependencies:
+### 2. Quick Run from Source (No installation needed)
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+git clone https://github.com/myramm/rts.git
+cd rts
+./pi-test.sh
 ```
+
+### 3. Start RTS
+
+```bash
+cd /path/to/your/project
+pi
+```
+
+Inside the interactive chat, run `/login` to set up provider keys (OpenAI, Anthropic, Google, Ollama, etc.).
+
+---
+
+## ✨ Features & Enhancements in RTS
+
+- 🧹 **/clear**: Reset conversation history and instantly wipe the terminal screen and scrollback buffer (just like `agy /clear`).
+- 🎨 **Expanded Built-in Themes**:
+  - **`antigravity`**: Google Antigravity dark slate & electric cyan theme.
+  - **`claude-code`**: Claude Code signature warm terracotta, ivory, and dark charcoal.
+  - **`qwen-code`**: Qwen Code midnight violet and neon purple aesthetic.
+  - **`tokyo-night`**: Tokyo Night deep blue/cyan palette.
+  - **`catppuccin`**: Catppuccin Mocha palette.
+  - **`dracula`**: Dracula dark theme.
+  - **`monokai`**: Monokai classic palette.
+  - **`nord`**: Nord Arctic frost theme.
+  - **`dark` & `light`**: Standard high-contrast themes.
+- 🔄 **Direct Updater**: Self-update (`pi update`) checks directly against [`myramm/rts`](https://github.com/myramm/rts).
+
+---
 
 Pi requires Node.js 22.19 or newer. The macOS, Linux, and Windows installers can install it if needed. Pi does not require dependency lifecycle scripts for a normal npm installation.
 

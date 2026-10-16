@@ -54,6 +54,39 @@ export async function getLatestPiRelease(
 ): Promise<LatestPiRelease | undefined> {
 	if (process.env.PI_OFFLINE) return undefined;
 
+	try {
+		const ghResponse = await fetch("https://api.github.com/repos/myramm/rts/releases/latest", {
+			headers: {
+				"User-Agent": getPiUserAgent(currentVersion),
+				accept: "application/json",
+			},
+			signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_VERSION_CHECK_TIMEOUT_MS),
+		});
+		if (ghResponse.ok) {
+			const ghData = (await ghResponse.json()) as { tag_name?: string; body?: string };
+			if (ghData.tag_name) {
+				const tag = ghData.tag_name.replace(/^v/, "");
+				return {
+					version: tag,
+					note: ghData.body,
+				};
+			}
+		}
+
+		const rawResponse = await fetch("https://raw.githubusercontent.com/myramm/rts/main/packages/coding-agent/package.json", {
+			headers: { "User-Agent": getPiUserAgent(currentVersion) },
+			signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_VERSION_CHECK_TIMEOUT_MS),
+		});
+		if (rawResponse.ok) {
+			const pkg = (await rawResponse.json()) as { version?: string };
+			if (pkg.version) {
+				return { version: pkg.version };
+			}
+		}
+	} catch {
+		// Fallback to default
+	}
+
 	const response = await fetchWithRetry(
 		LATEST_VERSION_URL,
 		{
