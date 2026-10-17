@@ -1,0 +1,414 @@
+import { createHash } from "crypto";
+import fs from "fs";
+import os from "os";
+import path from "path";
+let cachedAssetVersion = null;
+const BUILD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const IMAGE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const IMAGE_NAME_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const IMAGE_TAG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+function resolveAssetVersion() {
+    if (cachedAssetVersion)
+        return cachedAssetVersion;
+    const possiblePackageJsons = [
+        path.resolve(import.meta.dirname, "..", "package.json"), // src/ (native ts runtime) -> host/package.json
+        path.resolve(import.meta.dirname, "..", "..", "package.json"), // src/* (workspace) -> repo/package.json fallback
+    ];
+    for (const pkgPath of possiblePackageJsons) {
+        try {
+            if (!fs.existsSync(pkgPath))
+                continue;
+            const raw = fs.readFileSync(pkgPath, "utf8");
+            const pkg = JSON.parse(raw);
+            if (pkg.version) {
+                cachedAssetVersion = `v${pkg.version}`;
+                return cachedAssetVersion;
+            }
+        }
+        catch {
+            // ignore and fall through
+        }
+    }
+    cachedAssetVersion = "v0.0.0";
+    return cachedAssetVersion;
+}
+function cacheBaseDir() {
+    return process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache");
+}
+function getImageStoreDirectory() {
+    return (process.env.GONDOLIN_IMAGE_STORE ??
+        path.join(cacheBaseDir(), "gondolin", "images"));
+}
+function defaultGuestImageSelector() {
+    return process.env.GONDOLIN_DEFAULT_IMAGE ?? "alpine-base:latest";
+}
+/**
+ * Walk upwards from a starting directory until the filesystem root.
+ */
+function findUpwards(startDir, probe) {
+    let dir = path.resolve(startDir);
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+        const found = probe(dir);
+        if (found !== null)
+            return found;
+        const parent = path.dirname(dir);
+        if (parent === dir)
+            return null;
+        dir = parent;
+    }
+}
+function tryFindRepoGuestAssetsDir() {
+    const tryFindFrom = (anchor) => findUpwards(anchor, (dir) => {
+        const candidate = path.join(dir, "guest", "image", "out");
+        return assetsExist(candidate) ? candidate : null;
+    });
+    return tryFindFrom(process.cwd()) ?? tryFindFrom(import.meta.dirname);
+}
+function normalizeImageArch(value) {
+    if (!value)
+        return null;
+    const lower = value.toLowerCase();
+    if (lower === "aarch64" || lower === "arm64")
+        return "aarch64";
+    if (lower === "x86_64" || lower === "amd64" || lower === "x64") {
+        return "x86_64";
+    }
+    return null;
+}
+function hostDefaultImageArch() {
+    return normalizeImageArch(process.arch) ?? "x86_64";
+}
+function ensurePathWithinRoot(root, candidate) {
+    const resolvedRoot = path.resolve(root);
+    const resolvedCandidate = path.resolve(candidate);
+    const relative = path.relative(resolvedRoot, resolvedCandidate);
+    if (relative === ".." ||
+        relative.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relative)) {
+        return null;
+    }
+    return resolvedCandidate;
+}
+function hasValidImageNameSegments(name) {
+    const segments = name.split("/");
+    if (segments.length === 0)
+        return false;
+    for (const segment of segments) {
+        if (segment.length === 0 || segment === "." || segment === "..") {
+            return false;
+        }
+        if (!IMAGE_NAME_SEGMENT_PATTERN.test(segment)) {
+            return false;
+        }
+    }
+    return true;
+}
+function parseImageRef(selector) {
+    const trimmed = selector.trim();
+    if (!trimmed)
+        return null;
+    const colon = trimmed.lastIndexOf(":");
+    const hasExplicitTag = colon > 0 && colon < trimmed.length - 1;
+    const name = hasExplicitTag ? trimmed.slice(0, colon) : trimmed;
+    const tag = hasExplicitTag ? trimmed.slice(colon + 1) : "latest";
+    if (!IMAGE_NAME_PATTERN.test(name))
+        return null;
+    if (!hasValidImageNameSegments(name))
+        return null;
+    if (!IMAGE_TAG_PATTERN.test(tag))
+        return null;
+    return { name, tag };
+}
+function resolveDefaultImageAssetDirFromStore() {
+    const selector = defaultGuestImageSelector().trim();
+    if (!selector)
+        return null;
+    const storeDir = getImageStoreDirectory();
+    if (BUILD_ID_PATTERN.test(selector)) {
+        const objectDir = path.join(storeDir, "objects", selector);
+        return assetsExist(objectDir) ? objectDir : null;
+    }
+    const parsedRef = parseImageRef(selector);
+    if (!parsedRef)
+        return null;
+    const archOrder = [
+        hostDefaultImageArch(),
+        hostDefaultImageArch() === "aarch64" ? "x86_64" : "aarch64",
+    ];
+    const refsRoot = path.join(storeDir, "refs");
+    for (const arch of archOrder) {
+        const linkPath = ensurePathWithinRoot(refsRoot, path.join(refsRoot, parsedRef.name, parsedRef.tag, arch));
+        if (!linkPath || !fs.existsSync(linkPath))
+            continue;
+        try {
+            const target = fs.readlinkSync(linkPath);
+            const objectDir = path.resolve(path.dirname(linkPath), target);
+            if (assetsExist(objectDir)) {
+                return objectDir;
+            }
+        }
+        catch {
+            // ignore malformed links and continue fallback order
+        }
+    }
+    return null;
+}
+/**
+ * Determine where to look for guest assets.
+ *
+ * Priority:
+ * 1. GONDOLIN_GUEST_DIR environment variable (explicit override)
+ * 2. Local repo checkout (searches upwards for guest/image/out)
+ * 3. Local image store root (~/.cache/gondolin/images)
+ */
+function getAssetDir() {
+    if (process.env.GONDOLIN_GUEST_DIR) {
+        return process.env.GONDOLIN_GUEST_DIR;
+    }
+    const repoDir = tryFindRepoGuestAssetsDir();
+    if (repoDir)
+        return repoDir;
+    const localDefaultDir = resolveDefaultImageAssetDirFromStore();
+    if (localDefaultDir)
+        return localDefaultDir;
+    return getImageStoreDirectory();
+}
+export const MANIFEST_FILENAME = "manifest.json";
+// Fixed namespace UUID used for deriving deterministic guest asset build IDs.
+//
+// This must never change, otherwise the same asset checksums would produce
+// different IDs across versions.
+const GUEST_ASSET_BUILD_ID_NAMESPACE = "7b6ed0c0-7e7f-4c2a-8b2d-0bf3d5be9d52";
+function uuidToBytes(uuid) {
+    const hex = uuid.replace(/-/g, "");
+    if (hex.length !== 32)
+        throw new Error(`invalid uuid: ${uuid}`);
+    return Buffer.from(hex, "hex");
+}
+function bytesToUuid(bytes) {
+    const hex = Buffer.from(bytes).toString("hex");
+    return (hex.slice(0, 8) +
+        "-" +
+        hex.slice(8, 12) +
+        "-" +
+        hex.slice(12, 16) +
+        "-" +
+        hex.slice(16, 20) +
+        "-" +
+        hex.slice(20));
+}
+function uuidv5(name, namespace) {
+    const ns = uuidToBytes(namespace);
+    const hash = createHash("sha1");
+    hash.update(ns);
+    hash.update(Buffer.from(name, "utf8"));
+    const digest = hash.digest();
+    const bytes = Buffer.from(digest.subarray(0, 16));
+    // Set version to 5 (0101)
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    // Set variant to RFC 4122 (10xx)
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    return bytesToUuid(bytes);
+}
+/**
+ * Compute a deterministic guest asset build ID.
+ *
+ * This is intentionally derived from *content* (checksums), not host paths.
+ */
+export function computeAssetBuildId(input) {
+    const arch = input.arch ?? "unknown";
+    const parts = [
+        "gondolin-asset-build",
+        `kernel=${input.checksums.kernel}`,
+        `initramfs=${input.checksums.initramfs}`,
+        `rootfs=${input.checksums.rootfs}`,
+    ];
+    if (input.checksums.krunKernel !== undefined) {
+        parts.push(`krunKernel=${input.checksums.krunKernel}`);
+    }
+    if (input.checksums.krunInitrd !== undefined) {
+        parts.push(`krunInitrd=${input.checksums.krunInitrd}`);
+    }
+    parts.push(`arch=${arch}`);
+    return uuidv5(parts.join("\n"), GUEST_ASSET_BUILD_ID_NAMESPACE);
+}
+/**
+ * Load an asset manifest from a directory.
+ */
+export function loadAssetManifest(assetDir) {
+    const manifestPath = path.join(assetDir, MANIFEST_FILENAME);
+    if (!fs.existsSync(manifestPath)) {
+        return null;
+    }
+    try {
+        const content = fs.readFileSync(manifestPath, "utf8");
+        const raw = JSON.parse(content);
+        if (!raw || typeof raw !== "object") {
+            return null;
+        }
+        return raw;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Load guest assets from a custom directory.
+ *
+ * This is useful when you've built custom assets using `gondolin build`.
+ * The directory should contain manifest.json or the default filenames
+ * (vmlinuz-virt, initramfs.cpio.lz4, and rootfs.ext4).
+ *
+ * @param assetDir Path to the directory containing the assets
+ * @returns Paths to the guest assets
+ * @throws If any required assets are missing
+ */
+export function loadGuestAssets(assetDir) {
+    const resolvedDir = path.resolve(assetDir);
+    const manifest = loadAssetManifest(resolvedDir);
+    const assetFiles = manifest?.assets ?? {
+        kernel: "vmlinuz-virt",
+        initramfs: "initramfs.cpio.lz4",
+        rootfs: "rootfs.ext4",
+    };
+    const kernelPath = path.join(resolvedDir, assetFiles.kernel);
+    const initrdPath = path.join(resolvedDir, assetFiles.initramfs);
+    const rootfsPath = path.join(resolvedDir, assetFiles.rootfs);
+    const missing = [];
+    if (!fs.existsSync(kernelPath)) {
+        missing.push(assetFiles.kernel);
+    }
+    if (!fs.existsSync(initrdPath)) {
+        missing.push(assetFiles.initramfs);
+    }
+    if (!fs.existsSync(rootfsPath)) {
+        missing.push(assetFiles.rootfs);
+    }
+    if (assetFiles.krunKernel) {
+        const krunKernelPath = path.join(resolvedDir, assetFiles.krunKernel);
+        if (!fs.existsSync(krunKernelPath)) {
+            missing.push(assetFiles.krunKernel);
+        }
+    }
+    if (assetFiles.krunInitrd) {
+        const krunInitrdPath = path.join(resolvedDir, assetFiles.krunInitrd);
+        if (!fs.existsSync(krunInitrdPath)) {
+            missing.push(assetFiles.krunInitrd);
+        }
+    }
+    if (missing.length > 0) {
+        throw new Error(`Missing guest assets in ${resolvedDir}: ${missing.join(", ")}\n` +
+            `Run 'gondolin build' to create custom assets, or ensure the directory contains all required files.`);
+    }
+    return {
+        kernelPath,
+        initrdPath,
+        rootfsPath,
+    };
+}
+/**
+ * Check if all guest assets are present in a directory.
+ */
+function assetsExist(dir) {
+    const manifest = loadAssetManifest(dir);
+    const assetFiles = manifest?.assets ?? {
+        kernel: "vmlinuz-virt",
+        initramfs: "initramfs.cpio.lz4",
+        rootfs: "rootfs.ext4",
+    };
+    const required = fs.existsSync(path.join(dir, assetFiles.kernel)) &&
+        fs.existsSync(path.join(dir, assetFiles.initramfs)) &&
+        fs.existsSync(path.join(dir, assetFiles.rootfs));
+    if (!required) {
+        return false;
+    }
+    if (assetFiles.krunKernel &&
+        !fs.existsSync(path.join(dir, assetFiles.krunKernel))) {
+        return false;
+    }
+    if (assetFiles.krunInitrd &&
+        !fs.existsSync(path.join(dir, assetFiles.krunInitrd))) {
+        return false;
+    }
+    return true;
+}
+/**
+ * Ensure guest assets are available.
+ *
+ * Resolution priority:
+ * 1. GONDOLIN_GUEST_DIR environment override
+ * 2. Local dev checkout (`guest/image/out`)
+ * 3. Default image selector (`GONDOLIN_DEFAULT_IMAGE`, default `alpine-base:latest`)
+ */
+export async function ensureGuestAssets() {
+    if (process.env.GONDOLIN_GUEST_DIR) {
+        return loadGuestAssets(process.env.GONDOLIN_GUEST_DIR);
+    }
+    const repoDir = tryFindRepoGuestAssetsDir();
+    if (repoDir) {
+        return loadGuestAssets(repoDir);
+    }
+    const localDefaultDir = resolveDefaultImageAssetDirFromStore();
+    if (localDefaultDir) {
+        return loadGuestAssets(localDefaultDir);
+    }
+    const { ensureImageSelector } = await import("./images.js");
+    const resolved = await ensureImageSelector(defaultGuestImageSelector());
+    return loadGuestAssets(resolved.assetDir);
+}
+/**
+ * Get the current package-derived asset version string.
+ */
+export function getAssetVersion() {
+    return resolveAssetVersion();
+}
+/**
+ * Get the preferred local asset location root.
+ */
+export function getAssetDirectory() {
+    return getAssetDir();
+}
+/**
+ * Check if guest assets are available without downloading.
+ */
+export function hasGuestAssets() {
+    if (process.env.GONDOLIN_GUEST_DIR) {
+        return assetsExist(process.env.GONDOLIN_GUEST_DIR);
+    }
+    const repoDir = tryFindRepoGuestAssetsDir();
+    if (repoDir) {
+        return assetsExist(repoDir);
+    }
+    const localDefaultDir = resolveDefaultImageAssetDirFromStore();
+    return localDefaultDir !== null && assetsExist(localDefaultDir);
+}
+/**
+ * Resolve guest assets synchronously without downloading.
+ */
+export function resolveGuestAssetsSync() {
+    if (process.env.GONDOLIN_GUEST_DIR) {
+        return loadGuestAssets(process.env.GONDOLIN_GUEST_DIR);
+    }
+    const repoDir = tryFindRepoGuestAssetsDir();
+    if (repoDir && assetsExist(repoDir)) {
+        return loadGuestAssets(repoDir);
+    }
+    const localDefaultDir = resolveDefaultImageAssetDirFromStore();
+    if (!localDefaultDir || !assetsExist(localDefaultDir)) {
+        return null;
+    }
+    return loadGuestAssets(localDefaultDir);
+}
+/** @internal */
+export const __test = {
+    resolveAssetVersion,
+    getAssetDir,
+    assetsExist,
+    defaultGuestImageSelector,
+    resolveDefaultImageAssetDirFromStore,
+    resetAssetVersionCache: () => {
+        cachedAssetVersion = null;
+    },
+};
+//# sourceMappingURL=assets.js.map

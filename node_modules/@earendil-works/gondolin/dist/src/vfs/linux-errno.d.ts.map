@@ -1,0 +1,1 @@
+{"version":3,"file":"linux-errno.d.ts","sourceRoot":"","sources":["../../../src/vfs/linux-errno.ts"],"names":[],"mappings":"AAAA;;;;;;;GAOG;AACH,eAAO,MAAM,WAAW,EAAE,QAAQ,CAAC,MAAM,CAAC,MAAM,EAAE,MAAM,CAAC,CA6FvD,CAAC;AAEH,wBAAgB,YAAY,CAC1B,KAAK,EAAE,IAAI,CAAC,MAAM,CAAC,cAAc,EAAE,MAAM,GAAG,OAAO,CAAC,EACpD,QAAQ,SAAkB,GACzB,MAAM,CAaR"}

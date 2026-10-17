@@ -1,0 +1,1 @@
+{"version":3,"file":"post-build-copy.d.ts","sourceRoot":"","sources":["../../../src/alpine/post-build-copy.ts"],"names":[],"mappings":"AAGA,OAAO,KAAK,EAAE,kBAAkB,EAAE,MAAM,oBAAoB,CAAC;AAG7D,uEAAuE;AACvE,wBAAgB,oBAAoB,CAClC,SAAS,EAAE,MAAM,EACjB,OAAO,EAAE,kBAAkB,EAAE,EAC7B,GAAG,EAAE,CAAC,GAAG,EAAE,MAAM,KAAK,IAAI,GACzB,IAAI,CAuBN"}

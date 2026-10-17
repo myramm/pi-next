@@ -1,0 +1,756 @@
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { createHash } from "crypto";
+import { execFileSync } from "child_process";
+import { buildAlpineImages } from "./alpine.js";
+import { parseApkIndex } from "../alpine/packages.js";
+import { decompressTarGz, extractTarGz, parseTar } from "../alpine/tar.js";
+import { downloadFile, DownloadFileError } from "../alpine/utils.js";
+import { DEFAULT_ROOTFS_PACKAGES, INITRAMFS_FILENAME, KERNEL_FILENAME, ROOTFS_FILENAME, KRUN_KERNEL_FILENAME, KRUN_INITRD_FILENAME, resolveConfigPath, resolveSandboxBinaryPaths, writeAssetManifest, } from "./shared.js";
+const LIBKRUNFW_RELEASE_BASE_URL = "https://github.com/containers/libkrunfw/releases/download";
+const DEFAULT_LIBKRUNFW_VERSION = "v5.2.1";
+function hasOciRootfs(config) {
+    return config.oci !== undefined;
+}
+function resolveAlpineConfig(config) {
+    const alpine = config.alpine ?? { version: "3.23.0" };
+    const kernelPackage = alpine.kernelPackage ?? "linux-virt";
+    const useOciRootfs = hasOciRootfs(config);
+    const defaultRootfsPackages = useOciRootfs
+        ? []
+        : DEFAULT_ROOTFS_PACKAGES.map((pkg) => pkg === "linux-virt" ? kernelPackage : pkg);
+    const defaultInitramfsPackages = useOciRootfs ? [kernelPackage] : [];
+    const initramfsPackages = [
+        ...(alpine.initramfsPackages ?? defaultInitramfsPackages),
+    ];
+    if (useOciRootfs && !initramfsPackages.includes(kernelPackage)) {
+        initramfsPackages.unshift(kernelPackage);
+    }
+    return {
+        version: alpine.version,
+        branch: alpine.branch,
+        mirror: alpine.mirror,
+        kernelPackage: alpine.kernelPackage,
+        kernelImage: alpine.kernelImage,
+        krunfwVersion: alpine.krunfwVersion ?? DEFAULT_LIBKRUNFW_VERSION,
+        rootfsPackages: useOciRootfs
+            ? []
+            : (alpine.rootfsPackages ?? defaultRootfsPackages),
+        initramfsPackages,
+    };
+}
+/** Build assets natively (Linux or macOS with appropriate tools) */
+export async function buildNative(config, options, workDir, log) {
+    const outputDir = path.resolve(options.outputDir);
+    const configDir = options.configDir;
+    const binaries = await resolveSandboxBinaryPaths(config, options, log);
+    log("Building guest images...");
+    const alpineConfig = resolveAlpineConfig(config);
+    if (hasOciRootfs(config) &&
+        (config.alpine?.rootfsPackages?.length ?? 0) > 0) {
+        log("Ignoring alpine.rootfsPackages because oci rootfs source is enabled");
+    }
+    const { kernelPackage } = resolveKernelConfig(alpineConfig);
+    if (!hasOciRootfs(config)) {
+        warnOnKernelPackageMismatch(alpineConfig.rootfsPackages, kernelPackage);
+    }
+    const cacheDir = path.join(os.homedir(), ".cache", "gondolin", "build");
+    let rootfsInit;
+    let initramfsInit;
+    let rootfsInitExtra;
+    if (config.init?.rootfsInit) {
+        rootfsInit = fs.readFileSync(resolveConfigPath(config.init.rootfsInit, configDir), "utf8");
+    }
+    if (config.init?.initramfsInit) {
+        initramfsInit = fs.readFileSync(resolveConfigPath(config.init.initramfsInit, configDir), "utf8");
+    }
+    if (config.init?.rootfsInitExtra) {
+        rootfsInitExtra = fs.readFileSync(resolveConfigPath(config.init.rootfsInitExtra, configDir), "utf8");
+    }
+    const postBuildCopy = (config.postBuild?.copy ?? []).map((entry) => ({
+        src: resolveConfigPath(entry.src, configDir),
+        dest: entry.dest,
+    }));
+    let alpineUrl;
+    if (alpineConfig.mirror) {
+        const branch = alpineConfig.branch ??
+            `v${alpineConfig.version.split(".").slice(0, 2).join(".")}`;
+        alpineUrl = `${alpineConfig.mirror}/${branch}/releases/${config.arch}/alpine-minirootfs-${alpineConfig.version}-${config.arch}.tar.gz`;
+    }
+    const alpineBuild = await buildAlpineImages({
+        arch: config.arch,
+        alpineVersion: alpineConfig.version,
+        alpineBranch: alpineConfig.branch ??
+            `v${alpineConfig.version.split(".").slice(0, 2).join(".")}`,
+        alpineUrl,
+        ociRootfs: config.oci,
+        rootfsPackages: alpineConfig.rootfsPackages,
+        initramfsPackages: alpineConfig.initramfsPackages,
+        sandboxdBin: binaries.sandboxdPath,
+        sandboxfsBin: binaries.sandboxfsPath,
+        sandboxsshBin: binaries.sandboxsshPath,
+        sandboxingressBin: binaries.sandboxingressPath,
+        rootfsLabel: config.rootfs?.label ?? "gondolin-root",
+        rootfsSizeMb: config.rootfs?.sizeMb,
+        rootfsInit,
+        initramfsInit,
+        rootfsInitExtra,
+        postBuildCopy,
+        postBuildCommands: config.postBuild?.commands ?? [],
+        defaultEnv: config.env,
+        workDir,
+        cacheDir,
+        log,
+    });
+    log("Fetching kernel...");
+    await fetchKernel(workDir, config.arch, alpineConfig, cacheDir, log);
+    log("Fetching libkrunfw-compatible kernel...");
+    await fetchKrunBootAssets(workDir, config.arch, alpineConfig.krunfwVersion, cacheDir, log);
+    log("Copying assets to output directory...");
+    const kernelSrc = path.join(workDir, KERNEL_FILENAME);
+    const initramfsSrc = path.join(workDir, INITRAMFS_FILENAME);
+    const rootfsSrc = path.join(workDir, ROOTFS_FILENAME);
+    const krunKernelSrc = path.join(workDir, KRUN_KERNEL_FILENAME);
+    const krunInitrdSrc = path.join(workDir, KRUN_INITRD_FILENAME);
+    const kernelDst = path.join(outputDir, KERNEL_FILENAME);
+    const initramfsDst = path.join(outputDir, INITRAMFS_FILENAME);
+    const rootfsDst = path.join(outputDir, ROOTFS_FILENAME);
+    const krunKernelDst = path.join(outputDir, KRUN_KERNEL_FILENAME);
+    const krunInitrdDst = path.join(outputDir, KRUN_INITRD_FILENAME);
+    fs.copyFileSync(kernelSrc, kernelDst);
+    fs.copyFileSync(initramfsSrc, initramfsDst);
+    fs.copyFileSync(rootfsSrc, rootfsDst);
+    fs.copyFileSync(krunKernelSrc, krunKernelDst);
+    fs.copyFileSync(krunInitrdSrc, krunInitrdDst);
+    log("Generating manifest...");
+    const { manifestPath, manifest } = writeAssetManifest(outputDir, config, alpineBuild.ociSource);
+    log(`Build complete! Assets written to ${outputDir}`);
+    return {
+        outputDir,
+        manifestPath,
+        manifest,
+    };
+}
+function resolveKernelConfig(alpineConfig) {
+    const kernelPackage = alpineConfig.kernelPackage ?? "linux-virt";
+    const kernelImage = alpineConfig.kernelImage ?? deriveKernelImage(kernelPackage);
+    return { kernelPackage, kernelImage };
+}
+function deriveKernelImage(kernelPackage) {
+    if (kernelPackage.startsWith("linux-") &&
+        kernelPackage.length > "linux-".length) {
+        return `vmlinuz-${kernelPackage.slice("linux-".length)}`;
+    }
+    return "vmlinuz-virt";
+}
+function warnOnKernelPackageMismatch(rootfsPackages, kernelPackage) {
+    if (!rootfsPackages.includes(kernelPackage)) {
+        process.stderr.write(`Warning: rootfsPackages does not include kernel package '${kernelPackage}'. ` +
+            "This may cause module mismatches at boot.\n");
+    }
+}
+async function fetchKernel(outputDir, arch, alpineConfig, cacheDir, log) {
+    const kernelPath = path.join(outputDir, KERNEL_FILENAME);
+    if (fs.existsSync(kernelPath)) {
+        log("Kernel already present, skipping download");
+        return;
+    }
+    const version = alpineConfig.version;
+    const branch = alpineConfig.branch ?? `v${version.split(".").slice(0, 2).join(".")}`;
+    const mirror = alpineConfig.mirror ?? "https://dl-cdn.alpinelinux.org/alpine";
+    const { kernelPackage, kernelImage } = resolveKernelConfig(alpineConfig);
+    log(`Fetching ${kernelPackage} from Alpine ${branch} (${arch})`);
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const indexTarPath = path.join(cacheDir, `APKINDEX-main-${branch}-${arch}.tar.gz`);
+    const indexUrl = `${mirror}/${branch}/main/${arch}/APKINDEX.tar.gz`;
+    if (!fs.existsSync(indexTarPath)) {
+        await downloadFile(indexUrl, indexTarPath);
+    }
+    const raw = await decompressTarGz(indexTarPath);
+    const tarEntries = parseTar(raw);
+    const indexEntry = tarEntries.find((e) => e.name === "APKINDEX" && e.content);
+    if (!indexEntry?.content) {
+        throw new Error("APKINDEX not found in index tarball");
+    }
+    const pkgs = parseApkIndex(indexEntry.content.toString("utf8"));
+    const kernelMeta = pkgs.find((p) => p.P === kernelPackage);
+    if (!kernelMeta) {
+        throw new Error(`Failed to find ${kernelPackage} in APKINDEX`);
+    }
+    const kernelVersion = kernelMeta.V;
+    log(`Found ${kernelPackage} version: ${kernelVersion}`);
+    const apkFilename = `${kernelPackage}-${kernelVersion}.apk`;
+    const apkPath = path.join(cacheDir, `${arch}-${apkFilename}`);
+    if (!fs.existsSync(apkPath)) {
+        const apkUrl = `${mirror}/${branch}/main/${arch}/${apkFilename}`;
+        await downloadFile(apkUrl, apkPath);
+    }
+    const apkRaw = await decompressTarGz(apkPath);
+    const apkEntries = parseTar(apkRaw);
+    const kernelEntry = apkEntries.find((e) => e.name === `boot/${kernelImage}` && e.content);
+    if (!kernelEntry?.content) {
+        throw new Error(`Kernel image 'boot/${kernelImage}' not found in ${apkFilename}`);
+    }
+    fs.writeFileSync(kernelPath, kernelEntry.content);
+}
+async function fetchKrunBootAssets(outputDir, arch, krunfwVersion, cacheDir, log) {
+    const kernelPath = path.join(outputDir, KRUN_KERNEL_FILENAME);
+    const initrdPath = path.join(outputDir, KRUN_INITRD_FILENAME);
+    if (fs.existsSync(kernelPath) && fs.existsSync(initrdPath)) {
+        log("libkrunfw boot artifacts already present, skipping download");
+        return;
+    }
+    const casKernelPath = await ensureKrunKernelInCache(arch, krunfwVersion, cacheDir, log);
+    fs.copyFileSync(casKernelPath, kernelPath);
+    if (!fs.existsSync(initrdPath)) {
+        fs.writeFileSync(initrdPath, "");
+    }
+}
+async function ensureKrunKernelInCache(arch, krunfwVersion, cacheDir, log) {
+    const archName = mapKrunArch(arch);
+    const indexDir = path.join(cacheDir, "libkrunfw", "index", krunfwVersion, archName);
+    const digestPath = path.join(indexDir, "kernel.sha256");
+    if (fs.existsSync(digestPath)) {
+        const digest = fs.readFileSync(digestPath, "utf8").trim();
+        if (digest) {
+            const cached = path.join(cacheDir, "cas", "sha256", digest);
+            if (fs.existsSync(cached)) {
+                log(`Using cached libkrunfw kernel ${digest.slice(0, 12)}...`);
+                return cached;
+            }
+        }
+    }
+    const archive = await downloadKrunArchive(krunfwVersion, archName, cacheDir, log);
+    const kernel = await extractKrunKernelFromArchive(archive, archName, log);
+    const digest = sha256(kernel);
+    const casDir = path.join(cacheDir, "cas", "sha256");
+    fs.mkdirSync(casDir, { recursive: true });
+    const casPath = path.join(casDir, digest);
+    if (!fs.existsSync(casPath)) {
+        fs.writeFileSync(casPath, kernel);
+    }
+    fs.mkdirSync(indexDir, { recursive: true });
+    fs.writeFileSync(digestPath, `${digest}\n`);
+    log(`Cached libkrunfw kernel ${digest.slice(0, 12)}...`);
+    return casPath;
+}
+async function downloadKrunArchive(krunfwVersion, archName, cacheDir, log, download = downloadFile) {
+    const releaseDir = path.join(cacheDir, "libkrunfw", "downloads", krunfwVersion, archName);
+    fs.mkdirSync(releaseDir, { recursive: true });
+    const prebuiltName = `libkrunfw-prebuilt-${archName}.tgz`;
+    const prebuiltPath = path.join(releaseDir, prebuiltName);
+    if (fs.existsSync(prebuiltPath)) {
+        return { archivePath: prebuiltPath, kind: "prebuilt" };
+    }
+    const prebuiltUrl = `${LIBKRUNFW_RELEASE_BASE_URL}/${krunfwVersion}/${prebuiltName}`;
+    try {
+        log(`Downloading ${prebuiltUrl}`);
+        await download(prebuiltUrl, prebuiltPath);
+        return { archivePath: prebuiltPath, kind: "prebuilt" };
+    }
+    catch (err) {
+        if (!isNotFoundDownloadError(err)) {
+            throw err;
+        }
+        log(`No prebuilt libkrunfw archive for ${archName} (${krunfwVersion}); falling back to shared archive`);
+    }
+    const sharedName = `libkrunfw-${archName}.tgz`;
+    const sharedPath = path.join(releaseDir, sharedName);
+    if (!fs.existsSync(sharedPath)) {
+        const sharedUrl = `${LIBKRUNFW_RELEASE_BASE_URL}/${krunfwVersion}/${sharedName}`;
+        log(`Downloading ${sharedUrl}`);
+        await download(sharedUrl, sharedPath);
+    }
+    return { archivePath: sharedPath, kind: "shared" };
+}
+async function extractKrunKernelFromArchive(archive, archName, log) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gondolin-krunfw-"));
+    try {
+        const extractDir = path.join(tmpDir, "extract");
+        fs.mkdirSync(extractDir, { recursive: true });
+        await extractTarGz(archive.archivePath, extractDir);
+        if (archive.kind === "prebuilt") {
+            log("Extracting kernel from libkrunfw prebuilt archive");
+            return extractKernelFromPrebuiltArchive(extractDir);
+        }
+        log("Extracting kernel from libkrunfw shared archive");
+        return extractKernelFromSharedArchive(extractDir, archName);
+    }
+    finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+}
+function extractKernelBundleFromCSource(source) {
+    const assignment = /\bKERNEL_BUNDLE\s*\[\s*\]\s*=/.exec(source);
+    if (!assignment) {
+        throw new Error("libkrunfw kernel.c does not define KERNEL_BUNDLE");
+    }
+    const chunks = [];
+    let current = [];
+    let cursor = assignment.index + assignment[0].length;
+    let sawString = false;
+    const flush = () => {
+        if (current.length === 0)
+            return;
+        chunks.push(Buffer.from(current));
+        current = [];
+    };
+    const pushByte = (value) => {
+        current.push(value & 0xff);
+        if (current.length >= 64 * 1024)
+            flush();
+    };
+    while (cursor < source.length) {
+        cursor = skipCWhitespaceAndComments(source, cursor);
+        const ch = source[cursor];
+        if (ch === ";")
+            break;
+        if (ch !== '"') {
+            throw new Error("libkrunfw kernel.c KERNEL_BUNDLE is not a string literal");
+        }
+        sawString = true;
+        cursor = parseCStringLiteral(source, cursor, pushByte);
+    }
+    if (!sawString) {
+        throw new Error("libkrunfw kernel.c KERNEL_BUNDLE has no string data");
+    }
+    flush();
+    return Buffer.concat(chunks);
+}
+function skipCWhitespaceAndComments(source, offset) {
+    let cursor = offset;
+    while (cursor < source.length) {
+        const ch = source[cursor];
+        if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+            cursor += 1;
+            continue;
+        }
+        if (source.startsWith("//", cursor)) {
+            const newline = source.indexOf("\n", cursor + 2);
+            cursor = newline === -1 ? source.length : newline + 1;
+            continue;
+        }
+        if (source.startsWith("/*", cursor)) {
+            const end = source.indexOf("*/", cursor + 2);
+            if (end === -1) {
+                throw new Error("unterminated comment in libkrunfw kernel.c");
+            }
+            cursor = end + 2;
+            continue;
+        }
+        break;
+    }
+    return cursor;
+}
+function parseCStringLiteral(source, offset, pushByte) {
+    let cursor = offset + 1;
+    while (cursor < source.length) {
+        const code = source.charCodeAt(cursor);
+        cursor += 1;
+        if (code === 0x22) {
+            return cursor;
+        }
+        if (code !== 0x5c) {
+            pushByte(code);
+            continue;
+        }
+        if (cursor >= source.length)
+            break;
+        const escape = source[cursor];
+        cursor += 1;
+        switch (escape) {
+            case "'":
+            case '"':
+            case "?":
+            case "\\":
+                pushByte(escape.charCodeAt(0));
+                break;
+            case "a":
+                pushByte(0x07);
+                break;
+            case "b":
+                pushByte(0x08);
+                break;
+            case "f":
+                pushByte(0x0c);
+                break;
+            case "n":
+                pushByte(0x0a);
+                break;
+            case "r":
+                pushByte(0x0d);
+                break;
+            case "t":
+                pushByte(0x09);
+                break;
+            case "v":
+                pushByte(0x0b);
+                break;
+            case "\n":
+                break;
+            case "\r":
+                if (source[cursor] === "\n")
+                    cursor += 1;
+                break;
+            case "x": {
+                const start = cursor;
+                while (cursor < source.length &&
+                    isHexDigit(source.charCodeAt(cursor))) {
+                    cursor += 1;
+                }
+                if (cursor === start) {
+                    throw new Error("invalid hex escape in libkrunfw kernel.c");
+                }
+                pushByte(Number.parseInt(source.slice(start, cursor), 16));
+                break;
+            }
+            default:
+                if (isOctalDigit(escape.charCodeAt(0))) {
+                    let value = escape.charCodeAt(0) - 0x30;
+                    for (let i = 0; i < 2 && cursor < source.length; i++) {
+                        const next = source.charCodeAt(cursor);
+                        if (!isOctalDigit(next))
+                            break;
+                        value = value * 8 + (next - 0x30);
+                        cursor += 1;
+                    }
+                    pushByte(value);
+                    break;
+                }
+                throw new Error(`unsupported C string escape in libkrunfw kernel.c: \\${escape}`);
+        }
+    }
+    throw new Error("unterminated string literal in libkrunfw kernel.c");
+}
+function isHexDigit(code) {
+    return ((code >= 0x30 && code <= 0x39) ||
+        (code >= 0x41 && code <= 0x46) ||
+        (code >= 0x61 && code <= 0x66));
+}
+function isOctalDigit(code) {
+    return code >= 0x30 && code <= 0x37;
+}
+function extractKernelFromPrebuiltArchive(extractDir) {
+    const kernelCPath = path.join(extractDir, "libkrunfw", "kernel.c");
+    if (!fs.existsSync(kernelCPath)) {
+        throw new Error(`libkrunfw prebuilt archive missing libkrunfw/kernel.c at ${kernelCPath}`);
+    }
+    const kernel = extractKernelBundleFromCSource(fs.readFileSync(kernelCPath, "utf8"));
+    if (kernel.length === 0) {
+        throw new Error("libkrunfw prebuilt archive contains an empty kernel");
+    }
+    return kernel;
+}
+function extractKernelFromSharedArchive(extractDir, archName) {
+    const lib64Path = path.join(extractDir, "lib64", "libkrunfw.so");
+    const libPath = path.join(extractDir, "lib", "libkrunfw.so");
+    const sharedLibPath = fs.existsSync(lib64Path)
+        ? lib64Path
+        : fs.existsSync(libPath)
+            ? libPath
+            : null;
+    if (!sharedLibPath) {
+        throw new Error(`libkrunfw shared archive does not contain libkrunfw.so for ${archName}`);
+    }
+    const sharedLib = fs.readFileSync(sharedLibPath);
+    try {
+        return extractKernelBundleFromSharedLibraryBytes(sharedLib, archName);
+    }
+    catch (parseErr) {
+        const hostArch = hostKrunArch();
+        if (hostArch !== archName) {
+            throw new Error(`failed to extract kernel bundle from libkrunfw shared archive for ${archName}: ${formatExecError(parseErr)}`);
+        }
+        try {
+            return extractKernelFromSharedArchiveByExecution(sharedLibPath, archName);
+        }
+        catch (execErr) {
+            throw new Error(`failed to extract kernel bundle from libkrunfw shared archive for ${archName}; parser path failed (${formatExecError(parseErr)}); execution fallback failed (${formatExecError(execErr)})`);
+        }
+    }
+}
+function extractKernelFromSharedArchiveByExecution(sharedLibPath, archName) {
+    const libDir = path.dirname(sharedLibPath);
+    const buildDir = path.join(path.dirname(sharedLibPath), "build-shared");
+    fs.mkdirSync(buildDir, { recursive: true });
+    const extractorPath = path.join(buildDir, "extract-kernel");
+    const sourcePath = path.join(buildDir, "extract-kernel.c");
+    fs.writeFileSync(sourcePath, [
+        "#include <stdio.h>",
+        "#include <stddef.h>",
+        "extern char *krunfw_get_kernel(size_t *load_addr, size_t *entry_addr, size_t *size);",
+        "int main(void) {",
+        "  size_t load_addr = 0, entry_addr = 0, size = 0;",
+        "  char *kernel = krunfw_get_kernel(&load_addr, &entry_addr, &size);",
+        "  (void)load_addr;",
+        "  (void)entry_addr;",
+        "  if (!kernel || size == 0) {",
+        "    return 1;",
+        "  }",
+        "  return fwrite(kernel, 1, size, stdout) == size ? 0 : 1;",
+        "}",
+        "",
+    ].join("\n"));
+    try {
+        execFileSync("zig", [
+            "cc",
+            "-O2",
+            sourcePath,
+            `-L${libDir}`,
+            `-Wl,-rpath,${libDir}`,
+            "-lkrunfw",
+            "-o",
+            extractorPath,
+        ], {
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+    }
+    catch (err) {
+        throw new Error(`failed to compile libkrunfw kernel extractor for ${archName}: ${formatExecError(err)}`);
+    }
+    try {
+        const kernel = execFileSync(extractorPath, [], {
+            env: {
+                ...process.env,
+                LD_LIBRARY_PATH: `${libDir}:${process.env.LD_LIBRARY_PATH ?? ""}`,
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+            maxBuffer: 512 * 1024 * 1024,
+        });
+        if (kernel.length === 0) {
+            throw new Error("libkrunfw shared extractor produced an empty kernel");
+        }
+        return kernel;
+    }
+    catch (err) {
+        throw new Error(`failed to run libkrunfw kernel extractor for ${archName}: ${formatExecError(err)}`);
+    }
+}
+function extractKernelBundleFromSharedLibraryBytes(bytes, archName) {
+    if (bytes.length < 64) {
+        throw new Error("ELF header is truncated");
+    }
+    if (!bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+        throw new Error("file is not an ELF shared library");
+    }
+    const elfClass = bytes.readUInt8(4);
+    if (elfClass !== 2) {
+        throw new Error(`unsupported ELF class ${elfClass} (expected ELF64)`);
+    }
+    const endianTag = bytes.readUInt8(5);
+    const endian = endianTag === 1
+        ? "le"
+        : endianTag === 2
+            ? "be"
+            : (() => {
+                throw new Error(`unsupported ELF data encoding ${endianTag}`);
+            })();
+    const machine = readU16(bytes, 18, endian);
+    const expectedMachine = archName === "aarch64" ? 183 : 62;
+    if (machine !== expectedMachine) {
+        throw new Error(`ELF machine ${machine} does not match expected ${expectedMachine} for ${archName}`);
+    }
+    const sections = parseElfSections(bytes, endian);
+    const dynsym = sections.find((section) => section.type === 11);
+    if (!dynsym) {
+        throw new Error("ELF does not contain .dynsym section");
+    }
+    if (dynsym.entrySize <= 0) {
+        throw new Error("ELF .dynsym has invalid entry size");
+    }
+    if (dynsym.entrySize < 24) {
+        throw new Error("ELF .dynsym entry size is too small for ELF64");
+    }
+    const dynstr = sections[dynsym.link];
+    if (!dynstr) {
+        throw new Error("ELF .dynsym string table link is out of range");
+    }
+    const dynstrBytes = sliceChecked(bytes, dynstr.offset, dynstr.size);
+    const symbolCount = Math.floor(dynsym.size / dynsym.entrySize);
+    let symbolValue = -1;
+    let symbolSize = -1;
+    let symbolSectionIndex = -1;
+    for (let i = 0; i < symbolCount; i += 1) {
+        const entryOffset = dynsym.offset + i * dynsym.entrySize;
+        const entry = sliceChecked(bytes, entryOffset, dynsym.entrySize);
+        const nameOffset = readU32(entry, 0, endian);
+        if (nameOffset >= dynstrBytes.length) {
+            continue;
+        }
+        const name = readCString(dynstrBytes, nameOffset);
+        if (name !== "KERNEL_BUNDLE") {
+            continue;
+        }
+        symbolSectionIndex = readU16(entry, 6, endian);
+        symbolValue = readU64(entry, 8, endian);
+        symbolSize = readU64(entry, 16, endian);
+        break;
+    }
+    if (symbolValue < 0 || symbolSize <= 0) {
+        throw new Error("ELF does not expose KERNEL_BUNDLE symbol");
+    }
+    const bySection = tryResolveSymbolOffsetFromSection(sections, symbolSectionIndex, symbolValue, symbolSize);
+    if (bySection !== null) {
+        return normalizeKrunKernelBundle(sliceChecked(bytes, bySection, symbolSize));
+    }
+    const byLoadSegment = tryResolveSymbolOffsetFromProgramHeaders(bytes, endian, symbolValue, symbolSize);
+    if (byLoadSegment !== null) {
+        return normalizeKrunKernelBundle(sliceChecked(bytes, byLoadSegment, symbolSize));
+    }
+    throw new Error("failed to map KERNEL_BUNDLE symbol to file bytes");
+}
+function normalizeKrunKernelBundle(bytes) {
+    // Shared libkrunfw archives expose KERNEL_BUNDLE with a trailing `\0`
+    // sentinel while `krunfw_get_kernel` reports `size - 1`
+    if (bytes.length > 0 && bytes[bytes.length - 1] === 0) {
+        return bytes.subarray(0, bytes.length - 1);
+    }
+    return bytes;
+}
+function parseElfSections(bytes, endian) {
+    const sectionHeaderOffset = readU64(bytes, 40, endian);
+    const sectionHeaderEntrySize = readU16(bytes, 58, endian);
+    const sectionHeaderCount = readU16(bytes, 60, endian);
+    if (sectionHeaderEntrySize <= 0) {
+        throw new Error("ELF section header entry size is invalid");
+    }
+    const tableSize = sectionHeaderEntrySize * sectionHeaderCount;
+    sliceChecked(bytes, sectionHeaderOffset, tableSize);
+    const sections = [];
+    for (let i = 0; i < sectionHeaderCount; i += 1) {
+        const off = sectionHeaderOffset + i * sectionHeaderEntrySize;
+        const entry = sliceChecked(bytes, off, sectionHeaderEntrySize);
+        sections.push({
+            type: readU32(entry, 4, endian),
+            offset: readU64(entry, 24, endian),
+            size: readU64(entry, 32, endian),
+            link: readU32(entry, 40, endian),
+            address: readU64(entry, 16, endian),
+            entrySize: readU64(entry, 56, endian),
+        });
+    }
+    return sections;
+}
+function tryResolveSymbolOffsetFromSection(sections, sectionIndex, symbolValue, symbolSize) {
+    if (sectionIndex < 0 || sectionIndex >= sections.length) {
+        return null;
+    }
+    // 0 and values >= 0xff00 are undefined/reserved in ELF
+    if (sectionIndex === 0 || sectionIndex >= 0xff00) {
+        return null;
+    }
+    const section = sections[sectionIndex];
+    const symbolEnd = symbolValue + symbolSize;
+    const sectionEnd = section.address + section.size;
+    if (symbolValue < section.address || symbolEnd > sectionEnd) {
+        return null;
+    }
+    return section.offset + (symbolValue - section.address);
+}
+function tryResolveSymbolOffsetFromProgramHeaders(bytes, endian, symbolValue, symbolSize) {
+    const programHeaderOffset = readU64(bytes, 32, endian);
+    const programHeaderEntrySize = readU16(bytes, 54, endian);
+    const programHeaderCount = readU16(bytes, 56, endian);
+    if (programHeaderEntrySize <= 0 || programHeaderCount <= 0) {
+        return null;
+    }
+    const tableSize = programHeaderEntrySize * programHeaderCount;
+    sliceChecked(bytes, programHeaderOffset, tableSize);
+    for (let i = 0; i < programHeaderCount; i += 1) {
+        const off = programHeaderOffset + i * programHeaderEntrySize;
+        const entry = sliceChecked(bytes, off, programHeaderEntrySize);
+        const type = readU32(entry, 0, endian);
+        if (type !== 1) {
+            continue;
+        }
+        const fileOffset = readU64(entry, 8, endian);
+        const virtualAddress = readU64(entry, 16, endian);
+        const fileSize = readU64(entry, 32, endian);
+        const segmentEnd = virtualAddress + fileSize;
+        const symbolEnd = symbolValue + symbolSize;
+        if (symbolValue < virtualAddress || symbolEnd > segmentEnd) {
+            continue;
+        }
+        return fileOffset + (symbolValue - virtualAddress);
+    }
+    return null;
+}
+function sliceChecked(bytes, offset, size) {
+    if (offset < 0 || size < 0) {
+        throw new Error("ELF bounds are negative");
+    }
+    if (offset + size > bytes.length) {
+        throw new Error("ELF bounds exceed file length");
+    }
+    return bytes.subarray(offset, offset + size);
+}
+function readCString(bytes, offset) {
+    const end = bytes.indexOf(0, offset);
+    if (end === -1) {
+        throw new Error("unterminated string in ELF table");
+    }
+    return bytes.toString("utf8", offset, end);
+}
+function readU16(bytes, offset, endian) {
+    return endian === "le"
+        ? bytes.readUInt16LE(offset)
+        : bytes.readUInt16BE(offset);
+}
+function readU32(bytes, offset, endian) {
+    return endian === "le"
+        ? bytes.readUInt32LE(offset)
+        : bytes.readUInt32BE(offset);
+}
+function readU64(bytes, offset, endian) {
+    const value = endian === "le"
+        ? bytes.readBigUInt64LE(offset)
+        : bytes.readBigUInt64BE(offset);
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error("ELF value exceeds JavaScript safe integer range");
+    }
+    return Number(value);
+}
+function formatExecError(err) {
+    if (!(err instanceof Error)) {
+        return String(err);
+    }
+    const execErr = err;
+    const stdout = typeof execErr.stdout === "string"
+        ? execErr.stdout
+        : Buffer.isBuffer(execErr.stdout)
+            ? execErr.stdout.toString("utf8")
+            : "";
+    const stderr = typeof execErr.stderr === "string"
+        ? execErr.stderr
+        : Buffer.isBuffer(execErr.stderr)
+            ? execErr.stderr.toString("utf8")
+            : "";
+    const output = `${stdout}${stderr}`.trim();
+    if (!output) {
+        return execErr.message;
+    }
+    return `${execErr.message}: ${output}`;
+}
+function mapKrunArch(arch) {
+    return arch === "aarch64" ? "aarch64" : "x86_64";
+}
+function hostKrunArch() {
+    if (process.arch === "arm64")
+        return "aarch64";
+    if (process.arch === "x64")
+        return "x86_64";
+    return null;
+}
+function isNotFoundDownloadError(err) {
+    return err instanceof DownloadFileError && err.status === 404;
+}
+function sha256(buf) {
+    return createHash("sha256").update(buf).digest("hex");
+}
+export const __test = {
+    downloadKrunArchive,
+    extractKernelBundleFromCSource,
+    extractKernelBundleFromSharedLibraryBytes,
+};
+//# sourceMappingURL=native.js.map

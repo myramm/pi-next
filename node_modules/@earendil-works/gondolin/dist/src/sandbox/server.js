@@ -1,0 +1,830 @@
+import { EventEmitter } from "events";
+import { Duplex, PassThrough, Readable } from "stream";
+import { getHostNodeArchCached } from "../host/arch.js";
+import { AsyncSingleflight } from "../utils/async.js";
+import { toBufferIterable } from "../utils/buffer-iter.js";
+import { buildExecRequest, buildPtyResize, buildStdinData, buildExecWindow, buildFileDeleteRequest, buildFileReadRequest, buildFileWriteData, buildFileWriteRequest, } from "./virtio-protocol.js";
+import { encodeOutputFrame, } from "./control-protocol.js";
+import { SandboxController, } from "./controller.js";
+import { KrunController } from "./krun-controller.js";
+import { QemuNetworkBackend } from "../qemu/net.js";
+import { FsRpcService } from "../vfs/rpc-service.js";
+import { LINUX_ERRNO } from "../vfs/linux-errno.js";
+import { SandboxVfsProvider } from "../vfs/provider.js";
+import { stripTrailingNewline, } from "../debug.js";
+import { resolveSandboxServerOptions, resolveSandboxServerOptionsAsync, } from "./server-options.js";
+import { MAX_REQUEST_ID, TcpForwardStream, VirtioBridge, estimateBase64Bytes, isValidRequestId, parseMac, } from "./server-transport.js";
+import { LocalSandboxClient, sendBinary, sendError, sendJson, } from "./client.js";
+import { buildSandboxfsAppend, isSameSandboxFsConfig, normalizeSandboxFsConfig, } from "./server-boot-config.js";
+import { SandboxServerOps, installSandboxServerOps } from "./server-ops.js";
+const DEFAULT_MAX_STDIN_BYTES = 64 * 1024;
+export class SandboxServer extends EventEmitter {
+    emitDebug(component, message) {
+        const normalized = stripTrailingNewline(message);
+        this.emit("debug", component, normalized);
+        // Legacy string log event
+        this.emit("log", `[${component}] ${normalized}` + (message.endsWith("\n") ? "\n" : ""));
+    }
+    normalizeQemuHintLine(line) {
+        let normalized = stripTrailingNewline(line).trimEnd();
+        if (!normalized)
+            return null;
+        // Avoid leaking control sequences / non-printable bytes into client-visible
+        // error messages. This is especially important when QEMU is configured with
+        // -serial stdio, where stdout may contain untrusted guest console output.
+        normalized = normalized
+            .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "") // ANSI CSI
+            .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "") // ANSI OSC
+            // Strip C0 control characters (except TAB) + DEL
+            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+            .replace(/\r/g, "");
+        normalized = normalized.trimEnd();
+        if (!normalized)
+            return null;
+        return normalized;
+    }
+    recordQemuLogLine(line) {
+        const normalized = this.normalizeQemuHintLine(line);
+        if (!normalized)
+            return;
+        this.qemuLogTail.push(normalized);
+        // Keep a small tail so error messages can include likely root causes.
+        if (this.qemuLogTail.length > 50) {
+            this.qemuLogTail.splice(0, this.qemuLogTail.length - 50);
+        }
+    }
+    isLowValueQemuHintLine(line) {
+        const trimmed = line.trim();
+        if (!trimmed)
+            return true;
+        if (trimmed === "^")
+            return true;
+        if (trimmed === "(additional stack frames may have been skipped...)") {
+            return true;
+        }
+        if (/^\?\?\?:\?\?:\?:/.test(trimmed))
+            return true;
+        if (/^error\(DebugAllocator\): memory address .* leaked:/.test(trimmed)) {
+            return true;
+        }
+        if (/^error: [A-Z][A-Za-z0-9_]*$/.test(trimmed))
+            return true;
+        if (/\.zig:\d+:\d+:\s+0x[0-9a-f]+ in /.test(trimmed)) {
+            return true;
+        }
+        if (trimmed === "}")
+            return true;
+        if (trimmed.startsWith("_ ="))
+            return true;
+        if (/^(return|try|const|var|if|defer)\b/.test(trimmed))
+            return true;
+        if (trimmed.startsWith("std.")) {
+            return true;
+        }
+        return false;
+    }
+    selectQemuHintLine() {
+        for (let i = this.qemuLogTail.length - 1; i >= 0; i -= 1) {
+            const line = this.qemuLogTail[i];
+            if (!this.isLowValueQemuHintLine(line))
+                return line;
+        }
+        return this.qemuLogTail[this.qemuLogTail.length - 1] ?? null;
+    }
+    formatQemuLogHint() {
+        const hint = this.selectQemuHintLine();
+        if (!hint)
+            return "";
+        const truncated = hint.length > 300 ? hint.slice(0, 300) + "…" : hint;
+        const label = this.options.vmm === "krun" ? "krun" : "qemu";
+        return ` (${label}: ${truncated})`;
+    }
+    debugFlags;
+    hasDebug(flag) {
+        return this.debugFlags.has(flag);
+    }
+    options;
+    controller;
+    bridge;
+    fsBridge;
+    sshBridge;
+    ingressBridge;
+    network;
+    internalOptions;
+    tcpStreams = new Map();
+    tcpOpenWaiters = new Map();
+    nextTcpStreamId = 1;
+    ingressTcpStreams = new Map();
+    ingressTcpOpenWaiters = new Map();
+    nextIngressTcpStreamId = 1;
+    baseAppend;
+    vfsProvider;
+    fsService = null;
+    /** VFS requests currently executing in the host filesystem service */
+    activeVfsRequests = 0;
+    clients = new Set();
+    inflight = new Map();
+    stdinAllowed = new Set();
+    /** exec admission tokens while host-side async resume is pending */
+    pendingExecAdmissions = new Map();
+    // Exec requests that are accepted by the host API but not yet started on the
+    // guest control channel (currently only used while a file operation is active)
+    execQueue = [];
+    /** exec ids whose exec_request frame has been sent to sandboxd */
+    startedExecs = new Set();
+    queuedStdin = new Map();
+    queuedStdinBytes = new Map();
+    /** total bytes buffered in queuedStdin across all queued exec ids in `bytes` */
+    queuedStdinBytesTotal = 0;
+    /** stdin credits available to send to sandboxd, tracked in `bytes` */
+    stdinCredits = new Map();
+    queuedPtyResize = new Map();
+    // Pending exec_window credits that could not be sent due to virtio queue pressure
+    pendingExecWindows = new Map();
+    nextFileOpId = 1;
+    activeFileOpId = null;
+    fileOps = new Map();
+    bridgeWritableWaiters = [];
+    execWindowFlushScheduled = false;
+    execIoFlushScheduled = false;
+    startSingleflight = new AsyncSingleflight();
+    closeSingleflight = new AsyncSingleflight();
+    started = false;
+    qemuStdoutBuffer = "";
+    qemuStderrBuffer = "";
+    /** recent QEMU stderr log lines, used to enrich error messages */
+    qemuLogTail = [];
+    status = "stopped";
+    vfsReady = false;
+    vfsReadyTimer = null;
+    bootConfig = null;
+    /** @internal resolved VM backend name */
+    getVmmBackend() {
+        return this.options.vmm;
+    }
+    /** @internal resolved VM backend binary path */
+    getVmmPath() {
+        return this.options.vmm === "krun"
+            ? this.options.krunRunnerPath
+            : this.options.qemuPath;
+    }
+    /** @internal resolved qemu binary path */
+    getQemuPath() {
+        return this.options.qemuPath;
+    }
+    /**
+     * Create a SandboxServer, downloading guest assets if needed.
+     *
+     * This is the recommended way to create a server in production, as it will
+     * automatically download the guest image if it's not available locally.
+     *
+     * @param options Server configuration options
+     * @returns A configured SandboxServer instance
+     */
+    static async create(options = {}) {
+        const resolvedOptions = await resolveSandboxServerOptionsAsync(options);
+        return new SandboxServer(resolvedOptions);
+    }
+    /**
+     * Create a SandboxServer synchronously.
+     *
+     * This constructor requires that guest assets are available locally (either
+     * in a development checkout or via GONDOLIN_GUEST_DIR). For automatic asset
+     * downloading, use the async `SandboxServer.create()` factory instead.
+     *
+     * @param options Server configuration options (or pre-resolved options)
+     */
+    constructor(options = {}, internalOptions = {}) {
+        super();
+        if (Object.hasOwn(options, "rootDiskSnapshot")) {
+            throw new Error("sandbox.rootDiskSnapshot has been removed; use VM rootfs.mode='memory' for backend-native ephemeral writes on qemu or rootfs.mode='cow' for a throwaway qcow2 overlay on disk");
+        }
+        this.on("error", (err) => {
+            const message = err instanceof Error ? err.message : String(err);
+            this.emitDebug("error", message);
+        });
+        // Detect if we received pre-resolved options (from static create())
+        // by checking for fields that only exist on resolved options.
+        const isResolved = "kernelPath" in options &&
+            "initrdPath" in options &&
+            "rootfsPath" in options &&
+            typeof options.kernelPath === "string" &&
+            typeof options.initrdPath === "string" &&
+            typeof options.rootfsPath === "string";
+        const resolvedOptions = isResolved
+            ? options
+            : resolveSandboxServerOptions(options);
+        this.options = resolvedOptions;
+        this.internalOptions = internalOptions;
+        this.debugFlags = new Set(this.options.debug ?? []);
+        this.vfsProvider = this.options.vfsProvider
+            ? this.options.vfsProvider instanceof SandboxVfsProvider
+                ? this.options.vfsProvider
+                : new SandboxVfsProvider(this.options.vfsProvider)
+            : null;
+        const hostArch = getHostNodeArchCached();
+        const consoleDevice = hostArch === "arm64" ? "ttyAMA0" : "ttyS0";
+        const defaultAppend = this.options.vmm === "krun"
+            ? "console=hvc0 root=/dev/vda rootfstype=ext4 rw init=/init"
+            : `console=${consoleDevice} initramfs_async=1`;
+        const baseAppend = (this.options.append ?? defaultAppend).trim();
+        this.baseAppend = baseAppend;
+        if (this.options.vmm === "krun") {
+            const krunConfig = {
+                krunRunnerPath: this.options.krunRunnerPath,
+                kernelPath: this.options.kernelPath,
+                initrdPath: this.options.initrdPath,
+                rootDiskPath: this.options.rootDiskPath,
+                rootDiskFormat: this.options.rootDiskFormat,
+                rootDiskReadOnly: this.options.rootDiskReadOnly,
+                memory: this.options.memory,
+                cpus: this.options.cpus,
+                virtioSocketPath: this.options.virtioSocketPath,
+                virtioFsSocketPath: this.options.virtioFsSocketPath,
+                virtioSshSocketPath: this.options.virtioSshSocketPath,
+                virtioIngressSocketPath: this.options.virtioIngressSocketPath,
+                netSocketPath: this.options.netEnabled
+                    ? this.options.netSocketPath
+                    : undefined,
+                netMac: this.options.netMac,
+                append: this.baseAppend,
+                console: this.options.console,
+                autoRestart: this.options.autoRestart,
+            };
+            this.controller = new KrunController(krunConfig);
+        }
+        else {
+            const sandboxConfig = {
+                qemuPath: this.options.qemuPath,
+                kernelPath: this.options.kernelPath,
+                initrdPath: this.options.initrdPath,
+                rootDiskPath: this.options.rootDiskPath,
+                rootDiskFormat: this.options.rootDiskFormat,
+                rootDiskVolatileMode: this.internalOptions.qemuRootDiskVolatileMode,
+                rootDiskReadOnly: this.options.rootDiskReadOnly,
+                memory: this.options.memory,
+                cpus: this.options.cpus,
+                virtioSocketPath: this.options.virtioSocketPath,
+                virtioFsSocketPath: this.options.virtioFsSocketPath,
+                virtioSshSocketPath: this.options.virtioSshSocketPath,
+                virtioIngressSocketPath: this.options.virtioIngressSocketPath,
+                netSocketPath: this.options.netEnabled
+                    ? this.options.netSocketPath
+                    : undefined,
+                netMac: this.options.netMac,
+                append: this.baseAppend,
+                machineType: this.options.machineType,
+                accel: this.options.accel,
+                cpu: this.options.cpu,
+                console: this.options.console,
+                qemuIdlePauseMs: this.options.qemuIdlePauseMs,
+                autoRestart: this.options.autoRestart,
+            };
+            this.controller = new SandboxController(sandboxConfig);
+        }
+        // The virtio control channel can briefly accumulate a lot of data (notably
+        // when streaming large stdin payloads). The default 8MiB buffer is too
+        // small for our guest-tests (which can push multi-megabyte binaries), and
+        // can cause spurious queue_full errors under slower virtio transport.
+        const maxPendingBytes = Math.max(8 * 1024 * 1024, (this.options.maxStdinBytes ?? DEFAULT_MAX_STDIN_BYTES) * 2);
+        this.bridge = new VirtioBridge(this.options.virtioSocketPath, maxPendingBytes);
+        this.bridge.onWritable = () => {
+            this.scheduleExecWindowFlush();
+            this.scheduleExecIoFlush();
+            this.flushBridgeWritableWaiters();
+        };
+        this.fsBridge = new VirtioBridge(this.options.virtioFsSocketPath);
+        // SSH/tcp-forward stream can be long-lived and high-throughput; allow a larger queue.
+        this.sshBridge = new VirtioBridge(this.options.virtioSshSocketPath, Math.max(maxPendingBytes, 64 * 1024 * 1024));
+        // Ingress proxy streams can also be long-lived and high-throughput.
+        this.ingressBridge = new VirtioBridge(this.options.virtioIngressSocketPath, Math.max(maxPendingBytes, 64 * 1024 * 1024));
+        this.fsService = this.vfsProvider
+            ? new FsRpcService(this.vfsProvider, {
+                logger: this.hasDebug("vfs")
+                    ? (message) => this.emitDebug("vfs", message)
+                    : undefined,
+            })
+            : null;
+        const mac = parseMac(this.options.netMac) ??
+            Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        this.network = this.options.netEnabled
+            ? new QemuNetworkBackend({
+                socketPath: this.options.netSocketPath,
+                vmMac: mac,
+                debug: this.hasDebug("net"),
+                fetch: this.options.fetch,
+                httpHooks: this.options.httpHooks,
+                dns: this.options.dns,
+                ssh: this.options.ssh,
+                tcp: this.options.tcp,
+                mitmCertDir: this.options.mitmCertDir,
+                maxHttpBodyBytes: this.options.maxHttpBodyBytes,
+                maxHttpResponseBodyBytes: this.options.maxHttpResponseBodyBytes,
+                allowWebSockets: this.options.allowWebSockets,
+            })
+            : null;
+        if (this.network) {
+            this.network.on("debug", (component, message) => {
+                this.emitDebug(component, message);
+            });
+            this.network.on("error", (err) => {
+                this.emit("error", err);
+            });
+            this.network.on("guest-activity-change", (active) => {
+                if (active) {
+                    const resume = this.resumeControllerForActivity();
+                    if (resume) {
+                        void resume
+                            .catch((err) => {
+                            this.emit("error", err instanceof Error ? err : new Error(String(err)));
+                        })
+                            .finally(() => {
+                            this.scheduleControllerIdlePause();
+                        });
+                    }
+                }
+                else {
+                    this.scheduleControllerIdlePause();
+                }
+            });
+        }
+        this.controller.on("state", (state) => {
+            if (state === "running") {
+                this.bridge.connect();
+                this.fsBridge.connect();
+                this.sshBridge.connect();
+                this.ingressBridge.connect();
+            }
+            if (state === "stopped") {
+                // The controller emits state="stopped" before emitting "exit".
+                // Defer failing inflight requests so the exit handler can include the
+                // exit code/signal and (sanitized) QEMU stderr hint.
+                queueMicrotask(() => {
+                    if (this.controller.getState() !== "stopped")
+                        return;
+                    if (this.inflight.size === 0)
+                        return;
+                    this.failInflight("sandbox_stopped", "sandbox is not running");
+                });
+            }
+            if (state === "starting") {
+                // Clear previous run's logs so hints stay scoped to the current VM.
+                this.qemuStdoutBuffer = "";
+                this.qemuStderrBuffer = "";
+                this.qemuLogTail = [];
+                this.vfsReady = false;
+                this.clearVfsReadyTimer();
+                this.status = "starting";
+            }
+            else if (state === "running") {
+                // Consider the sandbox "running" once QEMU has spawned.
+                //
+                // VFS readiness is verified separately (e.g. via `await VM.start()`).
+                // Relying on the guest's one-shot vfs_ready message can lead to
+                // deadlocks/timeouts if it is missed.
+                this.clearVfsReadyTimer();
+                this.status = "running";
+            }
+            else {
+                this.vfsReady = false;
+                this.clearVfsReadyTimer();
+                this.status = "stopped";
+            }
+            this.broadcastStatus(this.status);
+            if (this.status === "running") {
+                this.scheduleControllerIdlePause();
+            }
+        });
+        this.controller.on("exit", (info) => {
+            // Flush any unterminated chunks so exit diagnostics have a chance to
+            // include the last stderr line.
+            if (this.qemuStderrBuffer.length > 0) {
+                this.recordQemuLogLine(this.qemuStderrBuffer);
+                if (this.hasDebug("protocol")) {
+                    const normalized = this.normalizeQemuHintLine(this.qemuStderrBuffer);
+                    if (normalized)
+                        this.emitDebug("qemu", normalized);
+                }
+                this.qemuStderrBuffer = "";
+            }
+            if (this.qemuStdoutBuffer.length > 0) {
+                if (this.hasDebug("protocol")) {
+                    const normalized = this.normalizeQemuHintLine(this.qemuStdoutBuffer);
+                    if (normalized)
+                        this.emitDebug("qemu", `stdout: ${normalized}`);
+                }
+                this.qemuStdoutBuffer = "";
+            }
+            const detail = info.code !== null
+                ? `code=${info.code}`
+                : info.signal
+                    ? `signal=${info.signal}`
+                    : "";
+            const base = detail ? `sandbox exited (${detail})` : "sandbox exited";
+            this.failInflight("sandbox_stopped", base + this.formatQemuLogHint());
+            this.emit("exit", info);
+        });
+        this.controller.on("log", (chunkOrEntry, streamArg) => {
+            // Backwards/forwards compatibility: accept either (chunk, stream) or an
+            // object payload.
+            let stream = "stderr";
+            let chunk;
+            if (typeof chunkOrEntry === "string") {
+                chunk = chunkOrEntry;
+                if (streamArg === "stdout" || streamArg === "stderr") {
+                    stream = streamArg;
+                }
+            }
+            else {
+                chunk =
+                    typeof chunkOrEntry?.chunk === "string"
+                        ? chunkOrEntry.chunk
+                        : String(chunkOrEntry ?? "");
+                if (chunkOrEntry?.stream === "stdout" ||
+                    chunkOrEntry?.stream === "stderr") {
+                    stream = chunkOrEntry.stream;
+                }
+            }
+            let buffer = stream === "stdout" ? this.qemuStdoutBuffer : this.qemuStderrBuffer;
+            buffer += chunk;
+            let newlineIndex = buffer.indexOf("\n");
+            while (newlineIndex !== -1) {
+                const line = buffer.slice(0, newlineIndex + 1);
+                buffer = buffer.slice(newlineIndex + 1);
+                // Only use stderr for client-visible error hints to avoid leaking
+                // untrusted guest console output from -serial stdio.
+                if (stream === "stderr") {
+                    this.recordQemuLogLine(line);
+                }
+                if (this.hasDebug("protocol")) {
+                    const normalized = this.normalizeQemuHintLine(line);
+                    if (normalized) {
+                        this.emitDebug("qemu", stream === "stderr" ? normalized : `stdout: ${normalized}`);
+                    }
+                }
+                newlineIndex = buffer.indexOf("\n");
+            }
+            if (stream === "stdout") {
+                this.qemuStdoutBuffer = buffer;
+            }
+            else {
+                this.qemuStderrBuffer = buffer;
+            }
+        });
+        this.bridge.onMessage = (message) => {
+            if (this.hasDebug("protocol")) {
+                const id = isValidRequestId(message.id) ? message.id : "?";
+                const extra = message.t === "exec_output"
+                    ? ` stream=${message.p?.stream} bytes=${Buffer.isBuffer(message.p?.data) ? message.p.data.length : 0}`
+                    : message.t === "exec_response"
+                        ? ` exit=${message.p?.exit_code}`
+                        : message.t === "file_read_data"
+                            ? ` bytes=${Buffer.isBuffer(message.p?.data) ? message.p.data.length : 0}`
+                            : "";
+                this.emitDebug("protocol", `virtio rx t=${message.t} id=${id}${extra}`);
+            }
+            if (!isValidRequestId(message.id)) {
+                return;
+            }
+            if (message.t === "exec_output") {
+                const client = this.inflight.get(message.id);
+                if (!client)
+                    return;
+                const data = message.p.data;
+                try {
+                    if (!sendBinary(client, encodeOutputFrame(message.id, message.p.stream, data))) {
+                        this.inflight.delete(message.id);
+                        this.stdinAllowed.delete(message.id);
+                        this.stdinCredits.delete(message.id);
+                    }
+                }
+                catch {
+                    this.inflight.delete(message.id);
+                    this.stdinAllowed.delete(message.id);
+                    this.stdinCredits.delete(message.id);
+                }
+            }
+            else if (message.t === "exec_response") {
+                if (this.hasDebug("exec")) {
+                    this.emitDebug("exec", `exec done id=${message.id} exit=${message.p.exit_code}${message.p.signal ? ` signal=${message.p.signal}` : ""}`);
+                }
+                const client = this.inflight.get(message.id);
+                if (client) {
+                    sendJson(client, {
+                        type: "exec_response",
+                        id: message.id,
+                        exit_code: message.p.exit_code,
+                        signal: message.p.signal,
+                    });
+                }
+                this.inflight.delete(message.id);
+                this.startedExecs.delete(message.id);
+                this.stdinAllowed.delete(message.id);
+                this.stdinCredits.delete(message.id);
+                this.pendingExecWindows.delete(message.id);
+                this.clearQueuedStdin(message.id);
+                this.queuedPtyResize.delete(message.id);
+                this.scheduleControllerIdlePause();
+            }
+            else if (message.t === "stdin_window") {
+                const stdin = message.p?.stdin;
+                const credits = Number(stdin);
+                if (!Number.isFinite(credits) || credits <= 0)
+                    return;
+                // Ignore credits for unknown exec ids.
+                if (!this.inflight.has(message.id))
+                    return;
+                const prev = this.stdinCredits.get(message.id) ?? 0;
+                const next = Math.min(0xffffffff, prev + Math.trunc(credits));
+                this.stdinCredits.set(message.id, next);
+                if (!this.flushQueuedStdinFor(message.id)) {
+                    this.scheduleExecIoFlush();
+                }
+            }
+            else if (message.t === "file_read_data") {
+                const op = this.fileOps.get(message.id);
+                if (!op || op.kind !== "read")
+                    return;
+                const data = message.p.data;
+                if (!Buffer.isBuffer(data)) {
+                    this.rejectFileOperation(message.id, new Error("invalid file_read_data payload"));
+                    return;
+                }
+                op.stream.write(data);
+            }
+            else if (message.t === "file_read_done") {
+                this.resolveFileOperation(message.id);
+            }
+            else if (message.t === "file_write_done") {
+                this.resolveFileOperation(message.id);
+            }
+            else if (message.t === "file_delete_done") {
+                this.resolveFileOperation(message.id);
+            }
+            else if (message.t === "error") {
+                const code = String(message.p.code ?? "");
+                const client = this.inflight.get(message.id);
+                const isExecLifecycleTracked = this.startedExecs.has(message.id) || this.inflight.has(message.id);
+                const nonTerminalExecError = isExecLifecycleTracked && this.isNonTerminalExecErrorCode(code);
+                if (nonTerminalExecError) {
+                    // Backpressure validation errors are advisory; the exec session keeps
+                    // running and must retain id/lifecycle ownership without surfacing a
+                    // terminal client error.
+                    return;
+                }
+                if (client) {
+                    sendError(client, {
+                        type: "error",
+                        id: message.id,
+                        code: message.p.code,
+                        message: message.p.message,
+                    });
+                }
+                if (client) {
+                    this.inflight.delete(message.id);
+                    this.startedExecs.delete(message.id);
+                    this.stdinAllowed.delete(message.id);
+                    this.stdinCredits.delete(message.id);
+                    this.pendingExecWindows.delete(message.id);
+                    this.clearQueuedStdin(message.id);
+                    this.queuedPtyResize.delete(message.id);
+                }
+                else if (this.fileOps.has(message.id)) {
+                    this.rejectFileOperation(message.id, new Error(`${message.p.code}: ${message.p.message}`));
+                }
+                else if (this.startedExecs.has(message.id)) {
+                    // Orphaned exec (client disconnected): still clear guest-side lifecycle
+                    // tracking when sandboxd reports terminal failure.
+                    this.startedExecs.delete(message.id);
+                    this.stdinAllowed.delete(message.id);
+                    this.stdinCredits.delete(message.id);
+                    this.pendingExecWindows.delete(message.id);
+                    this.clearQueuedStdin(message.id);
+                    this.queuedPtyResize.delete(message.id);
+                }
+                else if (message.id === 0 && this.activeFileOpId !== null) {
+                    this.rejectFileOperation(this.activeFileOpId, new Error(`${message.p.code}: ${message.p.message}`));
+                }
+                this.scheduleControllerIdlePause();
+            }
+            else if (message.t === "vfs_ready") {
+                this.handleVfsReady();
+            }
+            else if (message.t === "vfs_error") {
+                this.handleVfsError(message.p.message);
+            }
+        };
+        this.fsBridge.onMessage = (message) => {
+            if (this.hasDebug("protocol")) {
+                const id = isValidRequestId(message.id) ? message.id : "?";
+                const extra = message.t === "fs_request" ? ` op=${message.p?.op}` : "";
+                this.emitDebug("protocol", `virtiofs rx t=${message.t} id=${id}${extra}`);
+            }
+            if (!isValidRequestId(message.id)) {
+                return;
+            }
+            if (message.t !== "fs_request") {
+                return;
+            }
+            this.controller.cancelIdlePause?.();
+            this.activeVfsRequests += 1;
+            void (async () => {
+                try {
+                    const resume = this.resumeControllerForActivity();
+                    if (resume)
+                        await resume;
+                    if (!this.fsService) {
+                        this.fsBridge.send({
+                            v: 1,
+                            t: "fs_response",
+                            id: message.id,
+                            p: {
+                                op: message.p.op,
+                                err: LINUX_ERRNO.ENOSYS,
+                                message: "filesystem service unavailable",
+                            },
+                        });
+                        return;
+                    }
+                    const response = await this.fsService.handleRequest(message);
+                    if (!this.fsBridge.send(response)) {
+                        this.emit("error", new Error("[fs] virtio bridge queue exceeded"));
+                    }
+                }
+                catch (err) {
+                    const detail = err instanceof Error ? err.message : "fs handler error";
+                    this.fsBridge.send({
+                        v: 1,
+                        t: "fs_response",
+                        id: message.id,
+                        p: {
+                            op: message.p.op,
+                            err: LINUX_ERRNO.EIO,
+                            message: detail,
+                        },
+                    });
+                    this.emit("error", err instanceof Error ? err : new Error(detail));
+                }
+                finally {
+                    this.activeVfsRequests = Math.max(0, this.activeVfsRequests - 1);
+                    this.scheduleControllerIdlePause();
+                }
+            })();
+        };
+        this.sshBridge.onMessage = (message) => {
+            if (this.hasDebug("protocol")) {
+                const id = isValidRequestId(message.id) ? message.id : "?";
+                const extra = message.t === "tcp_data"
+                    ? ` bytes=${Buffer.isBuffer(message.p?.data) ? message.p.data.length : 0}`
+                    : message.t === "tcp_opened"
+                        ? ` ok=${Boolean(message.p?.ok)}`
+                        : "";
+                this.emitDebug("protocol", `virtiossh rx t=${message.t} id=${id}${extra}`);
+            }
+            if (!isValidRequestId(message.id))
+                return;
+            if (message.t === "tcp_opened") {
+                const waiter = this.tcpOpenWaiters.get(message.id);
+                if (!waiter)
+                    return;
+                this.tcpOpenWaiters.delete(message.id);
+                const ok = Boolean(message.p?.ok);
+                const msg = typeof message.p?.message === "string"
+                    ? message.p.message
+                    : "tcp_open failed";
+                if (ok) {
+                    waiter.resolve();
+                }
+                else {
+                    const stream = this.tcpStreams.get(message.id);
+                    stream?.openFailed(msg);
+                    this.tcpStreams.delete(message.id);
+                    waiter.reject(new Error(msg));
+                    this.scheduleControllerIdlePause();
+                }
+                return;
+            }
+            if (message.t === "tcp_data") {
+                const stream = this.tcpStreams.get(message.id);
+                if (!stream)
+                    return;
+                const data = message.p?.data;
+                if (!Buffer.isBuffer(data))
+                    return;
+                stream.pushRemote(data);
+                return;
+            }
+            if (message.t === "tcp_close") {
+                const stream = this.tcpStreams.get(message.id);
+                if (!stream)
+                    return;
+                this.tcpStreams.delete(message.id);
+                const waiter = this.tcpOpenWaiters.get(message.id);
+                if (waiter) {
+                    this.tcpOpenWaiters.delete(message.id);
+                    waiter.reject(new Error("tcp stream closed"));
+                }
+                stream.remoteClose();
+                this.scheduleControllerIdlePause();
+                return;
+            }
+        };
+        this.sshBridge.onError = (err) => {
+            const message = err instanceof Error ? err.message : "unknown error";
+            this.emit("error", new Error(`[ssh] virtio bridge error: ${message}`));
+            // Fail any pending opens.
+            for (const [id, waiter] of this.tcpOpenWaiters.entries()) {
+                waiter.reject(new Error("ssh virtio bridge error"));
+                this.tcpOpenWaiters.delete(id);
+            }
+            for (const stream of this.tcpStreams.values()) {
+                stream.destroy(new Error("ssh virtio bridge error"));
+            }
+            this.tcpStreams.clear();
+            this.scheduleControllerIdlePause();
+        };
+        this.ingressBridge.onMessage = (message) => {
+            if (this.hasDebug("protocol")) {
+                const id = isValidRequestId(message.id) ? message.id : "?";
+                const extra = message.t === "tcp_data"
+                    ? ` bytes=${Buffer.isBuffer(message.p?.data) ? message.p.data.length : 0}`
+                    : message.t === "tcp_opened"
+                        ? ` ok=${Boolean(message.p?.ok)}`
+                        : "";
+                this.emitDebug("protocol", `virtioingress rx t=${message.t} id=${id}${extra}`);
+            }
+            if (!isValidRequestId(message.id))
+                return;
+            if (message.t === "tcp_opened") {
+                const waiter = this.ingressTcpOpenWaiters.get(message.id);
+                if (!waiter)
+                    return;
+                this.ingressTcpOpenWaiters.delete(message.id);
+                const ok = Boolean(message.p?.ok);
+                const msg = typeof message.p?.message === "string"
+                    ? message.p.message
+                    : "tcp_open failed";
+                if (ok) {
+                    waiter.resolve();
+                }
+                else {
+                    const stream = this.ingressTcpStreams.get(message.id);
+                    stream?.openFailed(msg);
+                    this.ingressTcpStreams.delete(message.id);
+                    waiter.reject(new Error(msg));
+                    this.scheduleControllerIdlePause();
+                }
+                return;
+            }
+            if (message.t === "tcp_data") {
+                const stream = this.ingressTcpStreams.get(message.id);
+                if (!stream)
+                    return;
+                const data = message.p?.data;
+                if (!Buffer.isBuffer(data))
+                    return;
+                stream.pushRemote(data);
+                return;
+            }
+            if (message.t === "tcp_close") {
+                const stream = this.ingressTcpStreams.get(message.id);
+                if (!stream)
+                    return;
+                this.ingressTcpStreams.delete(message.id);
+                const waiter = this.ingressTcpOpenWaiters.get(message.id);
+                if (waiter) {
+                    this.ingressTcpOpenWaiters.delete(message.id);
+                    waiter.reject(new Error("tcp stream closed"));
+                }
+                stream.remoteClose();
+                this.scheduleControllerIdlePause();
+                return;
+            }
+        };
+        this.ingressBridge.onError = (err) => {
+            const message = err instanceof Error ? err.message : "unknown error";
+            this.emit("error", new Error(`[ingress] virtio decode error: ${message}`));
+            // Fail any pending opens.
+            for (const [id, waiter] of this.ingressTcpOpenWaiters.entries()) {
+                waiter.reject(new Error("ingress virtio bridge error"));
+                this.ingressTcpOpenWaiters.delete(id);
+            }
+            for (const stream of this.ingressTcpStreams.values()) {
+                stream.destroy(new Error("ingress virtio bridge error"));
+            }
+            this.ingressTcpStreams.clear();
+            this.scheduleControllerIdlePause();
+        };
+        this.bridge.onError = (err) => {
+            const message = err instanceof Error ? err.message : "unknown error";
+            this.emit("error", new Error(`[virtio] bridge error: ${message}`));
+            this.failInflight("protocol_error", `virtio bridge error: ${message}` + this.formatQemuLogHint());
+        };
+        this.fsBridge.onError = (err) => {
+            const message = err instanceof Error ? err.message : "unknown error";
+            this.emit("error", new Error(`[fs] virtio bridge error: ${message}`));
+        };
+    }
+}
+installSandboxServerOps(SandboxServer);
+//# sourceMappingURL=server.js.map

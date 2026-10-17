@@ -1,0 +1,168 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import forge from "node-forge";
+export function getDefaultMitmCertDir() {
+    const cacheBase = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache");
+    return path.join(cacheBase, "gondolin", "ssl");
+}
+export function resolveMitmCertDir(mitmCertDir) {
+    return mitmCertDir ?? getDefaultMitmCertDir();
+}
+export async function loadOrCreateMitmCa(mitmDir) {
+    await fsp.mkdir(mitmDir, { recursive: true });
+    const caKeyPath = path.join(mitmDir, "ca.key");
+    const caCertPath = path.join(mitmDir, "ca.crt");
+    try {
+        const [keyPem, certPem] = await Promise.all([
+            fsp.readFile(caKeyPath, "utf8"),
+            fsp.readFile(caCertPath, "utf8"),
+        ]);
+        const key = forge.pki.privateKeyFromPem(keyPem);
+        const cert = forge.pki.certificateFromPem(certPem);
+        if (!isNonNegativeSerialNumberHex(cert.serialNumber)) {
+            throw new Error("persisted mitm ca cert has an unsafe serial number");
+        }
+        if (!mitmCaHasRequiredKeyIdentifiers(cert)) {
+            throw new Error("persisted mitm ca cert is missing required key identifiers");
+        }
+        return {
+            key,
+            cert,
+            keyPem,
+            certPem,
+        };
+    }
+    catch {
+        const generated = generateMitmCa();
+        await Promise.all([
+            fsp.writeFile(caKeyPath, generated.keyPem),
+            fsp.writeFile(caCertPath, generated.certPem),
+        ]);
+        return generated;
+    }
+}
+export function loadOrCreateMitmCaSync(mitmDir) {
+    fs.mkdirSync(mitmDir, { recursive: true });
+    const caKeyPath = path.join(mitmDir, "ca.key");
+    const caCertPath = path.join(mitmDir, "ca.crt");
+    try {
+        const keyPem = fs.readFileSync(caKeyPath, "utf8");
+        const certPem = fs.readFileSync(caCertPath, "utf8");
+        const key = forge.pki.privateKeyFromPem(keyPem);
+        const cert = forge.pki.certificateFromPem(certPem);
+        if (!isNonNegativeSerialNumberHex(cert.serialNumber)) {
+            throw new Error("persisted mitm ca cert has an unsafe serial number");
+        }
+        if (!mitmCaHasRequiredKeyIdentifiers(cert)) {
+            throw new Error("persisted mitm ca cert is missing required key identifiers");
+        }
+        return {
+            key,
+            cert,
+            keyPem,
+            certPem,
+        };
+    }
+    catch {
+        const generated = generateMitmCa();
+        fs.writeFileSync(caKeyPath, generated.keyPem);
+        fs.writeFileSync(caCertPath, generated.certPem);
+        return generated;
+    }
+}
+export function generatePositiveSerialNumber(byteLength = 16) {
+    const bytes = crypto.randomBytes(byteLength);
+    bytes[0] &= 0x7f;
+    if (bytes.every((value) => value === 0)) {
+        bytes[bytes.length - 1] = 1;
+    }
+    return bytes.toString("hex");
+}
+export function isNonNegativeSerialNumberHex(serialNumber) {
+    const normalized = serialNumber.trim().toLowerCase();
+    if (!/^[0-9a-f]+$/.test(normalized)) {
+        return false;
+    }
+    const firstByteHex = normalized.length > 1 ? normalized.slice(0, 2) : `0${normalized}`;
+    return parseInt(firstByteHex, 16) < 0x80;
+}
+export function getCertificateSubjectKeyIdentifierBytes(cert) {
+    const ext = cert.getExtension("subjectKeyIdentifier");
+    if (typeof ext?.subjectKeyIdentifier !== "string") {
+        return undefined;
+    }
+    const expected = cert.generateSubjectKeyIdentifier().getBytes();
+    const actual = forge.util.hexToBytes(ext.subjectKeyIdentifier);
+    return actual === expected ? actual : undefined;
+}
+export function certificateHasAuthorityKeyIdentifier(cert, expectedKeyIdentifierBytes) {
+    const ext = cert.getExtension("authorityKeyIdentifier");
+    if (typeof ext?.value !== "string") {
+        return false;
+    }
+    try {
+        const value = forge.asn1.fromDer(ext.value);
+        if (value.tagClass !== forge.asn1.Class.UNIVERSAL ||
+            value.type !== forge.asn1.Type.SEQUENCE ||
+            !Array.isArray(value.value)) {
+            return false;
+        }
+        return value.value.some((entry) => entry.tagClass === forge.asn1.Class.CONTEXT_SPECIFIC &&
+            entry.type === 0 &&
+            entry.constructed === false &&
+            entry.value === expectedKeyIdentifierBytes);
+    }
+    catch {
+        return false;
+    }
+}
+export function mitmCaHasRequiredKeyIdentifiers(cert) {
+    const subjectKeyIdentifier = getCertificateSubjectKeyIdentifierBytes(cert);
+    return (subjectKeyIdentifier !== undefined &&
+        certificateHasAuthorityKeyIdentifier(cert, subjectKeyIdentifier));
+}
+export function mitmLeafHasRequiredKeyIdentifiers(caCert, leafCert) {
+    const caSubjectKeyIdentifier = getCertificateSubjectKeyIdentifierBytes(caCert);
+    if (caSubjectKeyIdentifier === undefined) {
+        return false;
+    }
+    return (getCertificateSubjectKeyIdentifierBytes(leafCert) !== undefined &&
+        certificateHasAuthorityKeyIdentifier(leafCert, caSubjectKeyIdentifier));
+}
+function generateMitmCa() {
+    const keys = forge.pki.rsa.generateKeyPair(2048);
+    const cert = forge.pki.createCertificate();
+    cert.publicKey = keys.publicKey;
+    cert.serialNumber = generatePositiveSerialNumber();
+    const now = new Date(Date.now() - 5 * 60 * 1000);
+    cert.validity.notBefore = now;
+    cert.validity.notAfter = new Date(now);
+    cert.validity.notAfter.setDate(cert.validity.notBefore.getDate() + 3650);
+    const attrs = [{ name: "commonName", value: "gondolin-mitm-ca" }];
+    cert.setSubject(attrs);
+    cert.setIssuer(attrs);
+    cert.setExtensions([
+        { name: "basicConstraints", cA: true, critical: true },
+        {
+            name: "keyUsage",
+            keyCertSign: true,
+            cRLSign: true,
+            critical: true,
+        },
+        { name: "subjectKeyIdentifier" },
+        { name: "authorityKeyIdentifier", keyIdentifier: true },
+    ]);
+    cert.sign(keys.privateKey, forge.md.sha256.create());
+    const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
+    const certPem = forge.pki.certificateToPem(cert);
+    return {
+        key: keys.privateKey,
+        cert,
+        keyPem,
+        certPem,
+    };
+}
+//# sourceMappingURL=mitm.js.map

@@ -1,0 +1,362 @@
+import fs from "fs";
+import path from "path";
+import { createTempQcow2Overlay, ensureQemuImgAvailable, inferDiskFormatFromPath, rebaseQcow2InPlace, resolveQcow2BackingPath, } from "./qemu/img.js";
+import { loadAssetManifest, loadGuestAssets, } from "./assets.js";
+import { ensureImageSelector, getImageObjectDirectory, normalizeImageBuildId, } from "./images.js";
+const CHECKPOINT_SCHEMA_VERSION = 1;
+// Trailer format (appended to the end of the qcow2 file):
+//   [utf8 json bytes][8-byte magic][u64be json length]
+//
+// QEMU/qemu-img tolerate trailing bytes after the qcow2 image. We use that to
+// store the checkpoint metadata in the same file.
+//
+// Note: The magic is a file-format marker for "qcow2 + JSON trailer".
+// It is intentionally *not* tied to the JSON schema version.
+const TRAILER_MAGIC = Buffer.from("GONDCPT1"); // 8 bytes
+const TRAILER_SIZE = 16;
+let vmCreateFn = null;
+/** @internal */
+export function registerVmCreate(fn) {
+    vmCreateFn = fn;
+}
+function getVmCreate() {
+    if (!vmCreateFn) {
+        throw new Error("checkpoint resume requires vm runtime; import vm/core before calling resume()");
+    }
+    return vmCreateFn;
+}
+function normalizeSandboxVmm(value) {
+    if (typeof value !== "string")
+        return null;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "qemu" || normalized === "krun") {
+        return normalized;
+    }
+    return null;
+}
+function resolveRequestedResumeVmm(options) {
+    const explicitRaw = options.sandbox?.vmm;
+    if (explicitRaw !== undefined) {
+        const explicit = normalizeSandboxVmm(explicitRaw);
+        if (!explicit) {
+            throw new Error(`invalid sandbox vmm backend: ${String(explicitRaw)} (expected "qemu" or "krun")`);
+        }
+        return explicit;
+    }
+    return normalizeSandboxVmm(process.env.GONDOLIN_VMM) ?? "qemu";
+}
+function resolveCheckpointCompatibleVmm(data) {
+    let qemu = false;
+    let krun = false;
+    if (Array.isArray(data.compatibleVmm)) {
+        for (const entry of data.compatibleVmm) {
+            const normalized = normalizeSandboxVmm(entry);
+            if (normalized === "qemu")
+                qemu = true;
+            if (normalized === "krun")
+                krun = true;
+        }
+    }
+    if (!qemu && !krun) {
+        const createdWith = normalizeSandboxVmm(data.createdWithVmm);
+        if (createdWith === "qemu")
+            qemu = true;
+        if (createdWith === "krun")
+            krun = true;
+    }
+    // Legacy checkpoints were qemu-only.
+    if (!qemu && !krun) {
+        qemu = true;
+    }
+    const compatible = [];
+    if (qemu)
+        compatible.push("qemu");
+    if (krun)
+        compatible.push("krun");
+    return compatible;
+}
+function writeCheckpointTrailer(diskPath, data) {
+    const json = Buffer.from(JSON.stringify(data, null, 2) + "\n", "utf8");
+    const footer = Buffer.alloc(TRAILER_SIZE);
+    TRAILER_MAGIC.copy(footer, 0);
+    footer.writeBigUInt64BE(BigInt(json.length), 8);
+    fs.appendFileSync(diskPath, Buffer.concat([json, footer]));
+}
+function readCheckpointTrailer(diskPath) {
+    const fd = fs.openSync(diskPath, "r");
+    try {
+        const stat = fs.fstatSync(fd);
+        if (stat.size < TRAILER_SIZE) {
+            throw new Error(`checkpoint file has no trailer: ${diskPath}`);
+        }
+        const footer = Buffer.alloc(TRAILER_SIZE);
+        fs.readSync(fd, footer, 0, TRAILER_SIZE, stat.size - TRAILER_SIZE);
+        if (!footer.subarray(0, 8).equals(TRAILER_MAGIC)) {
+            throw new Error(`checkpoint file has no trailer: ${diskPath}`);
+        }
+        const len = footer.readBigUInt64BE(8);
+        if (len > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw new Error(`checkpoint trailer too large: ${String(len)} bytes`);
+        }
+        const jsonLen = Number(len);
+        const jsonStart = stat.size - TRAILER_SIZE - jsonLen;
+        if (jsonStart < 0) {
+            throw new Error(`invalid checkpoint trailer length: ${jsonLen}`);
+        }
+        const jsonBuf = Buffer.alloc(jsonLen);
+        fs.readSync(fd, jsonBuf, 0, jsonLen, jsonStart);
+        const raw = jsonBuf.toString("utf8");
+        const data = JSON.parse(raw);
+        if (data.version !== CHECKPOINT_SCHEMA_VERSION) {
+            throw new Error(`unsupported checkpoint version: ${String(data.version)}`);
+        }
+        return data;
+    }
+    finally {
+        fs.closeSync(fd);
+    }
+}
+function validateGuestAssetsExist(assets) {
+    return (fs.existsSync(assets.kernelPath) &&
+        fs.existsSync(assets.initrdPath) &&
+        fs.existsSync(assets.rootfsPath));
+}
+function findCommonAssetDir(assets) {
+    const kernelDir = path.dirname(assets.kernelPath);
+    const initrdDir = path.dirname(assets.initrdPath);
+    const rootfsDir = path.dirname(assets.rootfsPath);
+    if (kernelDir !== initrdDir || kernelDir !== rootfsDir)
+        return null;
+    return kernelDir;
+}
+function devGuestOutDirs() {
+    // Try to mirror host/src/assets.ts dev resolution. Keep this local to avoid
+    // exporting more internal APIs.
+    const possibleRepoRoots = [
+        path.resolve(import.meta.dirname, "..", ".."),
+        path.resolve(import.meta.dirname, "..", "..", ".."),
+    ];
+    return possibleRepoRoots.map((repoRoot) => path.join(repoRoot, "guest", "image", "out"));
+}
+function resolveAssetDirByBuildId(buildId) {
+    const canonicalBuildId = normalizeImageBuildId(buildId);
+    const searched = [];
+    const tryDir = (label, dir) => {
+        const resolved = path.resolve(dir);
+        searched.push(`${label}=${resolved}`);
+        const manifest = loadAssetManifest(resolved);
+        if (manifest?.buildId !== canonicalBuildId) {
+            return null;
+        }
+        // Ensure assets exist.
+        loadGuestAssets(resolved);
+        return resolved;
+    };
+    // 1) Explicit env override
+    if (process.env.GONDOLIN_GUEST_DIR) {
+        const found = tryDir("GONDOLIN_GUEST_DIR", process.env.GONDOLIN_GUEST_DIR);
+        if (found)
+            return { assetDir: found, searched };
+    }
+    // 2) Local dev checkout
+    for (const dir of devGuestOutDirs()) {
+        const found = tryDir("dev", dir);
+        if (found)
+            return { assetDir: found, searched };
+    }
+    // 3) Local image object store
+    const objectDir = getImageObjectDirectory(canonicalBuildId);
+    const foundObject = tryDir("image-object", objectDir);
+    if (foundObject)
+        return { assetDir: foundObject, searched };
+    const msg = `Unable to locate guest assets for checkpoint buildId=${canonicalBuildId}\n` +
+        `Searched:\n` +
+        searched.map((x) => `  - ${x}`).join("\n") +
+        `\n\n` +
+        `Fix: pull this build id (or any ref pointing to it), then retry resume\n` +
+        `  gondolin image inspect ${canonicalBuildId}`;
+    throw new Error(msg);
+}
+function ensureCheckpointBackedByRootfs(checkpointDiskPath, rootfsPath) {
+    const checkpointAbs = path.resolve(checkpointDiskPath);
+    const backingAbs = resolveQcow2BackingPath(checkpointDiskPath);
+    if (!backingAbs)
+        return;
+    if (backingAbs === checkpointAbs) {
+        throw new Error(`checkpoint is corrupt: qcow2 backing file points to itself (${checkpointAbs})`);
+    }
+    const desired = path.resolve(rootfsPath);
+    if (backingAbs === desired)
+        return;
+    rebaseQcow2InPlace(checkpointDiskPath, desired, inferDiskFormatFromPath(desired));
+}
+async function resolveGuestAssetsForResume(requiredBuildId, options) {
+    const canonicalRequiredBuildId = normalizeImageBuildId(requiredBuildId);
+    const userImagePath = options.sandbox?.imagePath;
+    if (userImagePath !== undefined) {
+        if (typeof userImagePath === "string") {
+            const resolved = await ensureImageSelector(userImagePath);
+            const assetDir = path.resolve(resolved.assetDir);
+            const manifest = loadAssetManifest(assetDir);
+            if (!manifest?.buildId) {
+                throw new Error(`guest assets at ${assetDir} are missing manifest buildId (cannot resume checkpoint)`);
+            }
+            if (manifest.buildId !== canonicalRequiredBuildId) {
+                throw new Error(`guest assets do not match checkpoint buildId\n` +
+                    `  required: ${canonicalRequiredBuildId}\n` +
+                    `  provided: ${manifest.buildId}\n` +
+                    `Fix: pass the correct assets directory to sandbox.imagePath`);
+            }
+            return { imagePath: assetDir, assets: loadGuestAssets(assetDir) };
+        }
+        if (userImagePath && typeof userImagePath === "object") {
+            const assets = userImagePath;
+            if (!assets.kernelPath || !assets.initrdPath || !assets.rootfsPath) {
+                throw new Error("sandbox.imagePath object must include kernelPath, initrdPath, and rootfsPath");
+            }
+            if (!validateGuestAssetsExist(assets)) {
+                throw new Error(`guest assets not found: ${assets.kernelPath}, ${assets.initrdPath}, ${assets.rootfsPath}`);
+            }
+            const commonDir = findCommonAssetDir(assets);
+            if (!commonDir) {
+                throw new Error("cannot validate sandbox.imagePath asset object: kernel/initrd/rootfs must be in the same directory to load manifest.json");
+            }
+            const manifest = loadAssetManifest(commonDir);
+            if (!manifest?.buildId) {
+                throw new Error(`guest assets at ${commonDir} are missing manifest buildId (cannot resume checkpoint)`);
+            }
+            if (manifest.buildId !== canonicalRequiredBuildId) {
+                throw new Error(`guest assets do not match checkpoint buildId\n` +
+                    `  required: ${canonicalRequiredBuildId}\n` +
+                    `  provided: ${manifest.buildId}\n` +
+                    `Fix: pass the correct assets directory to sandbox.imagePath`);
+            }
+            return { imagePath: userImagePath, assets };
+        }
+        throw new Error("sandbox.imagePath must be a directory path or an asset path object");
+    }
+    // Fast path: already present locally.
+    try {
+        const { assetDir } = resolveAssetDirByBuildId(canonicalRequiredBuildId);
+        return { imagePath: assetDir, assets: loadGuestAssets(assetDir) };
+    }
+    catch {
+        // Fall through to builtin registry pull by build id.
+    }
+    const ensured = await ensureImageSelector(canonicalRequiredBuildId);
+    const assetDir = path.resolve(ensured.assetDir);
+    return { imagePath: assetDir, assets: loadGuestAssets(assetDir) };
+}
+/**
+ * Disk-only checkpoint that can be resumed using qcow2 backing files.
+ */
+export class VmCheckpoint {
+    checkpointPath;
+    data;
+    baseVmOptions;
+    constructor(checkpointPath, data, baseVmOptions) {
+        this.checkpointPath = checkpointPath;
+        this.data = data;
+        this.baseVmOptions = baseVmOptions ?? null;
+    }
+    /** checkpoint name */
+    get name() {
+        return this.data.name;
+    }
+    /** absolute path to the checkpoint qcow2 file */
+    get path() {
+        return this.checkpointPath;
+    }
+    /** absolute path to the directory containing the checkpoint file */
+    get dir() {
+        return path.dirname(this.checkpointPath);
+    }
+    /** absolute path to the qcow2 disk file */
+    get diskPath() {
+        return this.checkpointPath;
+    }
+    /** deterministic guest asset build identifier (uuid) */
+    get guestAssetBuildId() {
+        return this.data.guestAssetBuildId;
+    }
+    toJSON() {
+        return this.data;
+    }
+    /**
+     * Resume the checkpoint into a new VM.
+     *
+     * The resumed VM is implemented as a fresh qcow2 overlay backed by this
+     * checkpoint's qcow2 disk image.
+     */
+    async resume(options = {}) {
+        const createVm = getVmCreate();
+        const base = this.baseVmOptions ?? {};
+        const mergedForResume = {
+            ...base,
+            ...options,
+            sandbox: {
+                ...(base.sandbox ?? {}),
+                ...(options.sandbox ?? {}),
+            },
+        };
+        const requestedVmm = resolveRequestedResumeVmm(mergedForResume);
+        const compatibleVmm = resolveCheckpointCompatibleVmm(this.data);
+        if (!compatibleVmm.includes(requestedVmm)) {
+            throw new Error(`checkpoint is not compatible with vmm=${requestedVmm} (compatible backends: ${compatibleVmm.join(", ")})`);
+        }
+        ensureQemuImgAvailable();
+        const checkpointDisk = this.diskPath;
+        if (!fs.existsSync(checkpointDisk)) {
+            throw new Error(`checkpoint disk not found: ${checkpointDisk}`);
+        }
+        const resolved = await resolveGuestAssetsForResume(this.data.guestAssetBuildId, mergedForResume);
+        // Fix qcow2 backing filename portability by rebasing in-place on resume.
+        ensureCheckpointBackedByRootfs(checkpointDisk, resolved.assets.rootfsPath);
+        const overlayPath = createTempQcow2Overlay(checkpointDisk, "qcow2");
+        const merged = {
+            ...mergedForResume,
+            sandbox: {
+                ...(mergedForResume.sandbox ?? {}),
+                imagePath: resolved.imagePath,
+                rootDiskPath: overlayPath,
+                rootDiskFormat: "qcow2",
+                rootDiskReadOnly: false,
+                rootDiskDeleteOnClose: true,
+            },
+        };
+        return (await createVm(merged));
+    }
+    /** @deprecated Use {@link resume} */
+    async clone(options = {}) {
+        return await this.resume(options);
+    }
+    /** Load a checkpoint from a qcow2 file with a metadata trailer. */
+    static load(checkpointPath) {
+        const resolved = path.resolve(checkpointPath);
+        const stat = fs.statSync(resolved);
+        if (stat.isDirectory()) {
+            throw new Error(`checkpoint path must be a .qcow2 file, got directory: ${resolved}`);
+        }
+        if (path.basename(resolved) === "checkpoint.json") {
+            throw new Error(`legacy checkpoint.json format is no longer supported: ${resolved}`);
+        }
+        const data = readCheckpointTrailer(resolved);
+        return new VmCheckpoint(resolved, data, null);
+    }
+    /** Delete the checkpoint file. */
+    delete() {
+        fs.rmSync(this.checkpointPath, { force: true });
+    }
+    /** Create a checkpoint metadata trailer and append it to a qcow2 file. */
+    static writeTrailer(diskPath, data) {
+        writeCheckpointTrailer(diskPath, data);
+    }
+}
+/** @internal */
+export const __test = {
+    normalizeSandboxVmm,
+    resolveRequestedResumeVmm,
+    resolveCheckpointCompatibleVmm,
+    resolveAssetDirByBuildId,
+};
+//# sourceMappingURL=checkpoint.js.map

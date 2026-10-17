@@ -1,0 +1,68 @@
+{
+  "name": "autoevals",
+  "version": "0.3.0",
+  "description": "Universal library for evaluating AI models",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/braintrustdata/autoevals.git"
+  },
+  "homepage": "https://www.braintrust.dev/docs",
+  "main": "./jsdist/index.js",
+  "module": "./jsdist/index.mjs",
+  "types": "./jsdist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./jsdist/index.d.ts",
+      "import": "./jsdist/index.mjs",
+      "module": "./jsdist/index.mjs",
+      "require": "./jsdist/index.js"
+    }
+  },
+  "files": [
+    "jsdist/**/*"
+  ],
+  "scripts": {
+    "preinstall": "node -e \"const userAgent = process.env.npm_config_user_agent || ''; if (process.env.INIT_CWD === process.cwd() && !userAgent.includes('pnpm/')) { console.error('Use pnpm in this repo.'); process.exit(1); }\"",
+    "build": "tsup",
+    "watch": "tsup --watch",
+    "docs": "npx typedoc --options typedoc.json js/index.ts",
+    "test": "vitest"
+  },
+  "engines": {
+    "pnpm": ">=10.27.0",
+    "npm": "please-use-pnpm",
+    "yarn": "please-use-pnpm"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@rollup/plugin-yaml": "^4.1.2",
+    "@types/js-levenshtein": "^1.1.3",
+    "@types/js-yaml": "^4.0.9",
+    "@types/mustache": "^4.2.6",
+    "@types/node": "^20.19.11",
+    "msw": "^2.10.5",
+    "tsup": "^8.5.0",
+    "tsx": "^3.14.0",
+    "typedoc": "^0.25.13",
+    "typedoc-plugin-markdown": "^3.17.1",
+    "typescript": "^5.9.2",
+    "vitest": "^2.1.9",
+    "zod": "3.25.67"
+  },
+  "peerDependencies": {
+    "zod": "^3.25.0 || ^4.0.0"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "compute-cosine-similarity": "^1.1.0",
+    "js-levenshtein": "^1.1.6",
+    "js-yaml": "^4.1.0",
+    "linear-sum-assignment": "^1.0.7",
+    "mustache": "^4.2.0",
+    "openai": "^6.7.0",
+    "zod-to-json-schema": "3.25.0"
+  },
+  "packageManager": "pnpm@10.33.0"
+}

@@ -1,0 +1,1 @@
+{"version":3,"file":"kernel-modules.d.ts","sourceRoot":"","sources":["../../../src/alpine/kernel-modules.ts"],"names":[],"mappings":"AAIA,OAAO,KAAK,EAAE,uBAAuB,EAAE,MAAM,YAAY,CAAC;AAK1D,wBAAgB,iBAAiB,CAC/B,SAAS,EAAE,MAAM,EACjB,YAAY,EAAE,MAAM,EACpB,GAAG,EAAE,CAAC,GAAG,EAAE,MAAM,KAAK,IAAI,EAC1B,OAAO,GAAE,uBAA4B,GACpC,IAAI,CAiCN"}

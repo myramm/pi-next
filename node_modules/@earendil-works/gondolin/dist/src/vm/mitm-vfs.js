@@ -1,0 +1,35 @@
+import { loadOrCreateMitmCaSync, resolveMitmCertDir } from "../mitm.js";
+import { listMountPaths } from "../vfs/mounts.js";
+import { MemoryProvider } from "../vfs/node/index.js";
+/** guest mount path for host-provided MITM trust material */
+const MITM_CA_MOUNT_PATH = "/etc/gondolin/mitm";
+/** cert filename inside the MITM mount */
+const MITM_CA_FILENAME = "ca.crt";
+export function resolveMitmMounts(options, mitmCertDir, netEnabled = true) {
+    if (options === null || !netEnabled)
+        return {};
+    const mountPaths = listMountPaths(options?.mounts);
+    if (mountPaths.includes(MITM_CA_MOUNT_PATH) ||
+        mountPaths.includes("/etc/gondolin")) {
+        return {};
+    }
+    return {
+        [MITM_CA_MOUNT_PATH]: createMitmCaProvider(mitmCertDir),
+    };
+}
+export function createMitmCaProvider(mitmCertDir) {
+    const resolvedDir = resolveMitmCertDir(mitmCertDir);
+    const ca = loadOrCreateMitmCaSync(resolvedDir);
+    const provider = new MemoryProvider();
+    const certPem = ca.certPem.endsWith("\n") ? ca.certPem : `${ca.certPem}\n`;
+    const handle = provider.openSync(`/${MITM_CA_FILENAME}`, "w");
+    try {
+        handle.writeFileSync(certPem);
+    }
+    finally {
+        handle.closeSync();
+    }
+    provider.setReadOnly();
+    return provider;
+}
+//# sourceMappingURL=mitm-vfs.js.map
