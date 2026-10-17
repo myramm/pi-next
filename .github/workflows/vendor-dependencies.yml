@@ -1,0 +1,50 @@
+name: Vendor Dependencies & Prebuilt Dist
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -sf $(which fdfind) /usr/local/bin/fd || true
+
+      - name: Install node dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build all packages and bundle
+        run: npm run build
+
+      - name: Commit node_modules and prebuilt dist
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add node_modules and built dist folders
+          git add -f node_modules
+          git add -f packages/*/dist || true
+
+          if git status --porcelain | grep -q .; then
+            git commit -m "chore: vendor node_modules and dist for instant install [skip ci]"
+            git push origin main
+          else
+            echo "No changes to commit."
+          fi

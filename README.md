@@ -4,28 +4,18 @@
 
 ## Installation & Getting Started
 
-### 1. Clone & Global Link (Recommended)
+### 1. Clone & Instant Install (Recommended)
+
+`node_modules` dan pre-built binaries sudah tersedia langsung di dalam repositori sehingga **tidak perlu menjalankan `npm install`** (sangat ramah untuk VPS dengan RAM terbatas seperti 1 GB).
 
 ```bash
 git clone https://github.com/myramm/pi-next.git
 cd pi-next
-
-# Install dependencies without heavy lifecycle scripts
-npm install --ignore-scripts
-
-# Link globally to use `pi` anywhere
-npm link packages/coding-agent
+chmod +x install.sh
+./install.sh
 ```
 
-### 2. Quick Run from Source (No installation needed)
-
-```bash
-git clone https://github.com/myramm/pi-next.git
-cd pi-next
-./pi-test.sh
-```
-
-### 3. Start pi
+### 2. Start pi
 
 ```bash
 cd /path/to/your/project

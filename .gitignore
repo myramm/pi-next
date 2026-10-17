@@ -1,11 +1,12 @@
-node_modules
-dist/
+# node_modules (tracked for instant install without npm install)
+# node_modules
+# dist/
 .artifacts/
 *.log
 .DS_Store
 *.tsbuildinfo
 # packages/*/node_modules/
-packages/*/dist/
+# packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
 packages/ai/src/providers/data/
